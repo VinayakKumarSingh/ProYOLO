@@ -1,0 +1,983 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="ProYOLO DefOps • Real-Time Physical Adversarial Patch Attack Detection and Surveillance Telemetry Console.">
+  <title>ProYOLO DefOps • Real-Time Surveillance Telemetry</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Outfit:wght@500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-base: #080c16;
+      --bg-panel: rgba(15, 23, 42, 0.75);
+      --bg-panel-border: rgba(255, 255, 255, 0.08);
+      --bg-panel-hover: rgba(30, 41, 59, 0.7);
+      
+      --accent-cyan: #06b6d4;
+      --accent-cyan-glow: rgba(6, 182, 212, 0.35);
+      --accent-emerald: #10b981;
+      --accent-emerald-glow: rgba(16, 185, 129, 0.35);
+      --accent-crimson: #ff2a5f;
+      --accent-crimson-glow: rgba(255, 42, 95, 0.45);
+      --accent-amber: #f59e0b;
+      
+      --text-primary: #f8fafc;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      
+      --font-main: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      --font-display: 'Outfit', sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg-base);
+      background-image: 
+        radial-gradient(circle at 15% 15%, rgba(6, 182, 212, 0.08) 0%, transparent 40%),
+        radial-gradient(circle at 85% 20%, rgba(255, 42, 95, 0.07) 0%, transparent 40%),
+        radial-gradient(circle at 50% 90%, rgba(16, 185, 129, 0.05) 0%, transparent 50%),
+        linear-gradient(180deg, #070a12 0%, #0a0f1d 100%);
+      color: var(--text-primary);
+      font-family: var(--font-main);
+      min-height: 100vh;
+      overflow-x: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Top Navigation Bar */
+    header {
+      background: rgba(11, 17, 32, 0.88);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--bg-panel-border);
+      padding: 14px 28px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+
+    .brand-container {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .brand-logo {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #ff2a5f 0%, #7c3aed 50%, #06b6d4 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 0 15px rgba(255, 42, 95, 0.35);
+    }
+
+    .brand-logo svg {
+      width: 22px;
+      height: 22px;
+      fill: none;
+      stroke: #ffffff;
+      stroke-width: 2;
+    }
+
+    .brand-text h1 {
+      font-family: var(--font-display);
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      background: linear-gradient(90deg, #ffffff 0%, #cbd5e1 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .brand-subtitle {
+      font-size: 0.72rem;
+      color: var(--accent-cyan);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-family: var(--font-mono);
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border-radius: 9999px;
+      font-size: 0.78rem;
+      font-family: var(--font-mono);
+      font-weight: 500;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      color: #34d399;
+      transition: all 0.3s ease;
+    }
+
+    .status-pill.disconnected {
+      background: rgba(245, 158, 11, 0.12);
+      border-color: rgba(245, 158, 11, 0.3);
+      color: #fbbf24;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #10b981;
+      box-shadow: 0 0 10px #10b981;
+      animation: pulse-dot 1.8s infinite;
+    }
+
+    .status-pill.disconnected .status-dot {
+      background: #f59e0b;
+      box-shadow: 0 0 10px #f59e0b;
+    }
+
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.85); }
+    }
+
+    .btn {
+      font-family: var(--font-main);
+      font-size: 0.82rem;
+      font-weight: 600;
+      padding: 7px 16px;
+      border-radius: 8px;
+      border: 1px solid var(--bg-panel-border);
+      background: rgba(30, 41, 59, 0.6);
+      color: var(--text-primary);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      transition: all 0.2s ease;
+      backdrop-filter: blur(8px);
+    }
+
+    .btn:hover {
+      background: rgba(51, 65, 85, 0.8);
+      border-color: rgba(255, 255, 255, 0.2);
+      transform: translateY(-1px);
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #ff2a5f 0%, #e11d48 100%);
+      border: none;
+      color: #fff;
+      box-shadow: 0 0 15px rgba(255, 42, 95, 0.3);
+    }
+
+    .btn-primary:hover {
+      background: linear-gradient(135deg, #ff4d79 0%, #f43f5e 100%);
+      box-shadow: 0 0 20px rgba(255, 42, 95, 0.5);
+    }
+
+    .btn-active {
+      background: rgba(6, 182, 212, 0.2);
+      border-color: rgba(6, 182, 212, 0.5);
+      color: #38bdf8;
+    }
+
+    /* Main Dashboard Layout */
+    main {
+      padding: 24px 28px;
+      max-width: 1720px;
+      width: 100%;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+      flex: 1;
+    }
+
+    /* Metrics Summary Bar */
+    .metrics-bar {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 16px;
+    }
+
+    .metric-card {
+      background: var(--bg-panel);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--bg-panel-border);
+      border-radius: 14px;
+      padding: 16px 20px;
+      position: relative;
+      overflow: hidden;
+      transition: border-color 0.25s, transform 0.25s;
+    }
+
+    .metric-card:hover {
+      border-color: rgba(255, 255, 255, 0.18);
+      transform: translateY(-2px);
+    }
+
+    .metric-card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: linear-gradient(90deg, transparent, var(--card-accent, #06b6d4), transparent);
+      opacity: 0.6;
+    }
+
+    .metric-card.alert-card::before {
+      --card-accent: #ff2a5f;
+      opacity: 0.9;
+    }
+
+    .metric-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .metric-title {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-secondary);
+      font-weight: 600;
+    }
+
+    .metric-icon {
+      font-size: 1.1rem;
+    }
+
+    .metric-value-row {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+    }
+
+    .metric-value {
+      font-family: var(--font-display);
+      font-size: 1.85rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      color: #fff;
+    }
+
+    .metric-unit {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    .metric-subtext {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+
+    .metric-badge {
+      display: inline-block;
+      font-size: 0.7rem;
+      font-family: var(--font-mono);
+      padding: 2px 8px;
+      border-radius: 6px;
+      margin-top: 6px;
+    }
+
+    .badge-green {
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.25);
+    }
+
+    .badge-red {
+      background: rgba(255, 42, 95, 0.15);
+      color: #ff6b8b;
+      border: 1px solid rgba(255, 42, 95, 0.3);
+      animation: alert-pulse 2s infinite;
+    }
+
+    @keyframes alert-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255, 42, 95, 0.4); }
+      50% { box-shadow: 0 0 12px 2px rgba(255, 42, 95, 0.5); }
+    }
+
+    /* Surveillance & Feed Grid */
+    .dashboard-grid {
+      display: grid;
+      grid-template-columns: 1.85fr 1.15fr;
+      gap: 24px;
+    }
+
+    @media (max-width: 1200px) {
+      .dashboard-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* Video Stream Panel */
+    .video-panel {
+      background: var(--bg-panel);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--bg-panel-border);
+      border-radius: 16px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .panel-title-group {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .panel-title {
+      font-family: var(--font-display);
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    /* Source Selector Toolbar */
+    .source-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: 8px 12px;
+      background: rgba(15, 23, 42, 0.65);
+      border: 1px solid var(--bg-panel-border);
+      border-radius: 10px;
+    }
+
+    .source-badge {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      padding: 5px 12px;
+      border-radius: 6px;
+      background: rgba(6, 182, 212, 0.15);
+      color: #38bdf8;
+      border: 1px solid rgba(6, 182, 212, 0.3);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+    }
+
+    .upload-status-pill {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      color: #a7f3d0;
+      display: none;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* Video Feed Container */
+    .video-feed-wrapper {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #020617;
+      border-radius: 12px;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      box-shadow: inset 0 0 50px rgba(0, 0, 0, 0.8), 0 8px 30px rgba(0, 0, 0, 0.5);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #liveVideoFeed {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      background: #040711;
+    }
+
+    /* Controls Bar */
+    .stream-controls {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding-top: 4px;
+    }
+
+    .controls-left, .controls-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .slider-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+    }
+
+    .slider-group input[type="range"] {
+      width: 100px;
+      accent-color: var(--accent-crimson);
+      cursor: pointer;
+    }
+
+    /* Threat Feed Panel */
+    .alerts-panel {
+      background: var(--bg-panel);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--bg-panel-border);
+      border-radius: 16px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      max-height: 760px;
+    }
+
+    .alerts-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .threat-counter-badge {
+      background: rgba(255, 42, 95, 0.2);
+      border: 1px solid rgba(255, 42, 95, 0.4);
+      color: #ff6b8b;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 3px 10px;
+      border-radius: 9999px;
+    }
+
+    .alerts-scroll-area {
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding-right: 4px;
+      flex: 1;
+    }
+
+    .alerts-scroll-area::-webkit-scrollbar {
+      width: 6px;
+    }
+    .alerts-scroll-area::-webkit-scrollbar-track {
+      background: rgba(255, 255, 255, 0.03);
+      border-radius: 4px;
+    }
+    .alerts-scroll-area::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.15);
+      border-radius: 4px;
+    }
+
+    /* Threat Alert Card */
+    .alert-item {
+      background: rgba(26, 34, 52, 0.75);
+      border: 1px solid rgba(255, 42, 95, 0.3);
+      border-left: 4px solid var(--accent-crimson);
+      border-radius: 10px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transition: all 0.25s ease;
+      animation: slideInAlert 0.35s ease-out;
+    }
+
+    @keyframes slideInAlert {
+      from {
+        opacity: 0;
+        transform: translateY(-12px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .alert-item:hover {
+      background: rgba(36, 46, 70, 0.85);
+      border-color: rgba(255, 42, 95, 0.6);
+      box-shadow: 0 4px 20px rgba(255, 42, 95, 0.15);
+    }
+
+    .alert-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .alert-cam-id {
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+      font-weight: 600;
+      color: #94a3b8;
+    }
+
+    .alert-prob-pill {
+      background: linear-gradient(135deg, rgba(255, 42, 95, 0.25) 0%, rgba(225, 29, 72, 0.25) 100%);
+      border: 1px solid rgba(255, 42, 95, 0.5);
+      color: #ff6b8b;
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .alert-content-row {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .alert-thumbnail-box {
+      width: 72px;
+      height: 72px;
+      border-radius: 8px;
+      background: #090e1a;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      overflow: hidden;
+      flex-shrink: 0;
+      position: relative;
+      cursor: pointer;
+    }
+
+    .alert-thumbnail-box img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    .alert-thumbnail-overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(255, 42, 95, 0.25);
+      border: 1px dashed rgba(255, 42, 95, 0.7);
+      border-radius: 7px;
+      pointer-events: none;
+    }
+
+    .alert-details {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .alert-track-info {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: #f1f5f9;
+    }
+
+    .alert-coords {
+      font-size: 0.7rem;
+      color: #64748b;
+      font-family: var(--font-mono);
+    }
+
+    .alert-features {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: 4px;
+    }
+
+    .feature-tag {
+      font-size: 0.65rem;
+      font-family: var(--font-mono);
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.05);
+      color: #94a3b8;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .feature-tag.highlight {
+      background: rgba(255, 42, 95, 0.12);
+      color: #ff9fb2;
+      border-color: rgba(255, 42, 95, 0.25);
+    }
+
+    .alert-time {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 48px 16px;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .empty-state svg {
+      width: 44px;
+      height: 44px;
+      stroke: #334155;
+    }
+
+    /* Modal for Snapshot Inspection */
+    .modal-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(4, 7, 14, 0.85);
+      backdrop-filter: blur(12px);
+      z-index: 100;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+
+    .modal-backdrop.open {
+      display: flex;
+    }
+
+    .modal-window {
+      background: #0f172a;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 16px;
+      max-width: 650px;
+      width: 100%;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      box-shadow: 0 25px 60px rgba(0, 0, 0, 0.8);
+    }
+
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .modal-title {
+      font-family: var(--font-display);
+      font-size: 1.15rem;
+      font-weight: 700;
+    }
+
+    .modal-close {
+      background: none;
+      border: none;
+      color: #94a3b8;
+      font-size: 1.4rem;
+      cursor: pointer;
+    }
+
+    .modal-close:hover {
+      color: #fff;
+    }
+
+    .modal-body {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .modal-img-container {
+      width: 100%;
+      max-height: 380px;
+      background: #020617;
+      border-radius: 10px;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .modal-img-container img {
+      max-width: 100%;
+      max-height: 380px;
+      object-fit: contain;
+    }
+
+    footer {
+      border-top: 1px solid var(--bg-panel-border);
+      padding: 14px 28px;
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-family: var(--font-mono);
+      background: rgba(11, 17, 32, 0.5);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Header Navigation -->
+  <header>
+    <div class="brand-container">
+      <div class="brand-logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="9"></circle>
+          <path d="M12 3v18M3 12h18M8 8l8 8M16 8l-8 8"></path>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <h1 id="main-heading">ProYOLO DefOps</h1>
+        <div class="brand-subtitle">Physical Adversarial Optical Patch Radar</div>
+      </div>
+    </div>
+
+    <div class="header-actions">
+      <div id="connectionStatus" class="status-pill">
+        <span class="status-dot"></span>
+        <span id="connectionLabel">WS CONNECTED</span>
+      </div>
+
+      <button id="btnAudioToggle" class="btn" title="Toggle radar sound alerts">
+        <span id="audioIcon">🔊</span> Audio Alert
+      </button>
+
+      <button id="btnTestAlert" class="btn btn-primary" title="Fire a test adversarial alert to verify pipeline">
+        <span>⚡</span> Test Alert
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Dashboard Content -->
+  <main>
+    <!-- Live Telemetry KPI Metrics Bar -->
+    <section class="metrics-bar" aria-label="System Metrics">
+      <!-- Card 1: FPS -->
+      <div class="metric-card">
+        <div class="metric-header">
+          <span class="metric-title">Inference Speed</span>
+          <span class="metric-icon">⚡</span>
+        </div>
+        <div class="metric-value-row">
+          <span id="metricFps" class="metric-value">16.2</span>
+          <span class="metric-unit">FPS</span>
+        </div>
+        <div class="metric-badge badge-green">Real-Time CCTV (CPU)</div>
+      </div>
+
+      <!-- Card 2: Latency -->
+      <div class="metric-card">
+        <div class="metric-header">
+          <span class="metric-title">Pipeline Latency</span>
+          <span class="metric-icon">⏱</span>
+        </div>
+        <div class="metric-value-row">
+          <span id="metricLatency" class="metric-value">15.4</span>
+          <span class="metric-unit">ms</span>
+        </div>
+        <div class="metric-subtext">YOLO + ByteTrack + Classifier</div>
+      </div>
+
+      <!-- Card 3: CPU Load -->
+      <div class="metric-card">
+        <div class="metric-header">
+          <span class="metric-title">CPU Utilization</span>
+          <span class="metric-icon">💻</span>
+        </div>
+        <div class="metric-value-row">
+          <span id="metricCpu" class="metric-value">22.4</span>
+          <span class="metric-unit">%</span>
+        </div>
+        <div class="metric-subtext">Multi-threaded ONNX Runtime</div>
+      </div>
+
+      <!-- Card 4: Persons Detected -->
+      <div class="metric-card">
+        <div class="metric-header">
+          <span class="metric-title">Persons Detected</span>
+          <span class="metric-icon">👤</span>
+        </div>
+        <div class="metric-value-row">
+          <span id="metricClean" class="metric-value">0</span>
+          <span class="metric-unit">persons</span>
+        </div>
+        <div class="metric-subtext">Verified Human Pedestrians</div>
+      </div>
+
+      <!-- Card 5: Attackers Flagged -->
+      <div class="metric-card alert-card">
+        <div class="metric-header">
+          <span class="metric-title">Attackers Flagged</span>
+          <span class="metric-icon">🚨</span>
+        </div>
+        <div class="metric-value-row">
+          <span id="metricAttacks" class="metric-value" style="color: #ff6b8b;">0</span>
+          <span class="metric-unit">attackers</span>
+        </div>
+        <div class="metric-badge badge-red">Adversarial Attackers Caught</div>
+      </div>
+    </section>
+
+    <!-- Main Grid: Real-Time Stream + Threat Feed -->
+    <div class="dashboard-grid">
+      
+      <!-- Left: Real Video Stream Inspection -->
+      <section class="video-panel" aria-label="Surveillance Feed">
+        <div class="panel-header">
+          <div class="panel-title-group">
+            <span class="panel-title">Surveillance Inspection Stream</span>
+          </div>
+          <div class="panel-tools">
+            <span style="font-family: var(--font-mono); font-size: 0.75rem; color: #64748b;">
+              Real-Time YOLOv8n + ByteTrack + Dual Anomaly
+            </span>
+          </div>
+        </div>
+
+        <!-- Video Source & Mode Controls Toolbar -->
+        <div class="source-toolbar">
+          <button id="btnWebcam" class="btn btn-active" title="Switch to live laptop webcam / device 0">
+            <span>📹</span> Webcam (Live)
+          </button>
+
+          <button id="btnUploadVideo" class="btn" title="Upload a recorded MP4/AVI surveillance video">
+            <span>📁</span> Upload Video
+          </button>
+          <input type="file" id="videoFileInput" accept=".mp4,.avi,.mov,.mkv" style="display: none;">
+
+          <button id="btnPlayPause" class="btn" title="Pause or resume video playback">
+            <span id="playPauseIcon">⏸</span> <span id="playPauseLabel">Pause</span>
+          </button>
+
+          <button id="btnLoopToggle" class="btn btn-active" title="Toggle automatic video looping on EOF">
+            <span>🔁</span> Loop: ON
+          </button>
+
+          <div style="flex: 1;"></div>
+
+          <div id="activeSourceBadge" class="source-badge">
+            <span>●</span> <span id="sourceLabelText">Webcam (Live)</span>
+          </div>
+
+          <div id="uploadStatusText" class="upload-status-pill">
+            <span>⏳</span> Uploading video...
+          </div>
+        </div>
+
+        <!-- Live MJPEG Stream Display -->
+        <div class="video-feed-wrapper">
+          <img id="liveVideoFeed" src="/api/v1/video-feed" alt="ProYOLO Real-Time Video Stream Feed">
+          <canvas id="streamCanvas" style="display:none;" aria-hidden="true"></canvas>
+        </div>
+
+        <div class="stream-controls">
+          <div class="controls-left">
+            <div class="slider-group">
+              <label for="thresholdSlider">Attack Threshold:</label>
+              <input type="range" id="thresholdSlider" min="0.4" max="0.95" step="0.05" value="0.65">
+              <span id="thresholdVal">0.65</span>
+            </div>
+          </div>
+          <div class="controls-right">
+            <span style="font-size: 0.72rem; color: var(--text-muted); font-family: var(--font-mono);">
+              Green Box: Person • Red Box: Attacker (Adversarial Patch)
+            </span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right: Real-Time Alerts Feed -->
+      <section class="alerts-panel" aria-label="Alerts Stream">
+        <div class="alerts-header">
+          <div class="panel-title-group">
+            <span class="panel-title">Real-Time Threat Feed</span>
+            <span id="threatBadge" class="threat-counter-badge">0 Alerts Logged</span>
+          </div>
+          <button id="btnClearAlerts" class="btn" style="padding: 4px 10px; font-size: 0.72rem;">
+            Clear View
+          </button>
+        </div>
+
+        <div id="alertsContainer" class="alerts-scroll-area">
+          <div id="emptyAlertsNotice" class="empty-state">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="1.5">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+              <path d="M9 12l2 2 4-4"></path>
+            </svg>
+            <div>No adversarial patch threats currently flagged.</div>
+            <div style="font-size: 0.72rem; color: #475569;">Incoming real-time attacks will appear here as video streams.</div>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+
+  <!-- Modal for Snapshot Detail View -->
+  <div id="snapshotModal" class="modal-backdrop">
+    <div class="modal-window">
+      <div class="modal-header">
+        <div class="modal-title">Threat Snapshot Forensics</div>
+        <button id="modalCloseBtn" class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-img-container">
+          <img id="modalImg" src="" alt="Threat Snapshot Preview">
+        </div>
+        <div id="modalDetails" style="font-family: var(--font-mono); font-size: 0.8rem; line-height: 1.6; color: #94a3b8;">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <footer>
+    <span>ProYOLO Defense • High-Throughput Real-Time Physical Adversarial Detection</span>
+    <span>FastAPI Engine • OpenCV Pipeline • ByteTrack 10-Frame Memory</span>
+  </footer>
+
+  <!-- Application Logic -->
+  <script src="/static/app.js"></script>
+</body>
+</html>
