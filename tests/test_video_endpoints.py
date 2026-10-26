@@ -347,3 +347,79 @@ def test_websocket_alert_event_emission(sync_client: TestClient):
         assert ws_msg["data"]["attack_probability"] == 0.95
         assert ws_msg["data"]["thumbnail_b64"] == "data:image/jpeg;base64,/9j/4AAQSkZJRg=="
         assert ws_msg["metrics"]["flagged_attacks"] >= 1
+
+
+def test_stream_engine_temporal_persistence_and_redis_alert():
+    """Verify StreamEngine enforces K=3 out of N=5 temporal persistence before dispatching alerts."""
+    from unittest.mock import MagicMock
+    from src.detection.detector import Detection
+    from src.classifier.attack_classifier import AttackPrediction
+    from src.server.stream_engine import StreamEngine
+
+    mock_detector = MagicMock()
+    det = Detection(
+        bbox=np.array([100.0, 100.0, 200.0, 300.0], dtype=np.float32),
+        confidence=0.85,
+        class_id=0,
+        class_name="person",
+        recovered_by_inpainting=True,
+        delta_p_obj=0.32,
+    )
+    mock_detector.detect_with_recovery.return_value = [det]
+
+    mock_fe = MagicMock()
+    mock_classifier = MagicMock()
+    mock_redis = MagicMock()
+    alert_callback = MagicMock()
+
+    engine = StreamEngine(
+        detector=mock_detector,
+        feature_extractor=mock_fe,
+        classifier=mock_classifier,
+        redis_manager=mock_redis,
+        alert_callback=alert_callback,
+    )
+
+    frame = np.full((480, 640, 3), 100, dtype=np.uint8)
+
+    # Frame 1: Attack predicted (1/1) -> should NOT dispatch alert yet
+    mock_classifier.predict.return_value = AttackPrediction(
+        is_attack=True,
+        attack_probability=0.92,
+        confidence_clean=0.08,
+        feature_importances={"hsv_entropy": 0.4},
+        top_contributing_features=[("hsv_entropy", 0.4)],
+        inference_latency_ms=1.2,
+        causal_verification_passed=True,
+        delta_p_obj=0.32,
+    )
+    annotated, items = engine.process_frame(frame, timestamp=1.0)
+    assert len(items) == 1
+    assert items[0]["is_attack"] is True
+    assert items[0]["confirmed_attack_alert"] is False
+    assert items[0]["recovered_by_inpainting"] is True
+    assert pytest.approx(items[0]["delta_p_obj"]) == 0.32
+    alert_callback.assert_not_called()
+    mock_redis.publish_alert.assert_not_called()
+
+    # Frame 2: Attack predicted (2/2) -> should NOT dispatch alert yet
+    engine.process_frame(frame, timestamp=2.0)
+    alert_callback.assert_not_called()
+    mock_redis.publish_alert.assert_not_called()
+
+    # Frame 3: Attack predicted (3/3 -> K=3 reached!) -> DOES dispatch alert!
+    engine.process_frame(frame, timestamp=3.0)
+    assert alert_callback.call_count == 1
+    assert mock_redis.publish_alert.call_count == 1
+
+    dispatched = alert_callback.call_args[0][0]
+    assert dispatched["confirmed_attack_alert"] is True
+    assert dispatched["recovered_by_inpainting"] is True
+    assert pytest.approx(dispatched["delta_p_obj"]) == 0.32
+    assert dispatched["attack_probability"] == 0.92
+
+    redis_dispatched = mock_redis.publish_alert.call_args[0][0]
+    assert redis_dispatched["confirmed_attack_alert"] is True
+    assert redis_dispatched["recovered_by_inpainting"] is True
+    assert pytest.approx(redis_dispatched["delta_p_obj"]) == 0.32
+

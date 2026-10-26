@@ -1,3 +1,4 @@
+
 """Real-Time Attack Classification Engine for ProYOLO.
 
 Evaluates fused 1D feature vectors from FeatureExtractor in <2 ms on CPU,
@@ -45,6 +46,8 @@ CLEAN_FEATURE_BASELINES: Dict[str, Tuple[float, float]] = {
     "color_hue_entropy": (0.25, 0.09),
     "color_sat_entropy": (0.25, 0.09),
     "color_val_entropy": (0.35, 0.10),
+    "max_grid_norm_ratio": (1.8, 0.4),
+    "jpeg_recompression_delta": (1.0, 0.2),
 }
 
 
@@ -57,6 +60,8 @@ class AttackPrediction(NamedTuple):
     feature_importances: Dict[str, float]
     top_contributing_features: List[Tuple[str, float]]
     inference_latency_ms: float
+    causal_verification_passed: bool = False
+    delta_p_obj: float = 0.0
 
 
 class AttackClassifier:
@@ -165,40 +170,111 @@ class AttackClassifier:
         equal_weight = 1.0 / float(len(FEATURE_NAMES))
         return {name: equal_weight for name in FEATURE_NAMES}
 
+    @staticmethod
+    def _check_patch_in_person(
+        patch_rois: Sequence[Sequence[float]],
+        person_bbox: Optional[Sequence[float]],
+    ) -> bool:
+        """Check if any candidate patch ROI overlaps or lies inside person bounding box."""
+        if person_bbox is None or not patch_rois:
+            # If no disjoint patch ROIs are explicitly specified, assume track upper body localization
+            return True
+
+        bx1, by1, bx2, by2 = (
+            float(person_bbox[0]),
+            float(person_bbox[1]),
+            float(person_bbox[2]),
+            float(person_bbox[3]),
+        )
+        for roi in patch_rois:
+            rx1, ry1, rx2, ry2 = float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3])
+            ix1 = max(rx1, bx1)
+            iy1 = max(ry1, by1)
+            ix2 = min(rx2, bx2)
+            iy2 = min(ry2, by2)
+            inter_w = max(0.0, ix2 - ix1)
+            inter_h = max(0.0, iy2 - iy1)
+            if (inter_w * inter_h) > 0.0:
+                return True
+        return False
+
     def predict(
         self,
         features: Union[np.ndarray, FeaturePacket, Sequence[float]],
+        delta_p_obj: float = 0.0,
+        patch_roi: Optional[Sequence[float]] = None,
+        patch_rois: Optional[Sequence[Sequence[float]]] = None,
+        person_bbox: Optional[Sequence[float]] = None,
+        recovered_objects_count: int = 0,
+        conf_drop: Optional[float] = None,
+        max_grid_norm_ratio: Optional[float] = None,
     ) -> AttackPrediction:
-        """Predict attack probability and generate alert explanation for a single track.
+        """Predict attack probability and evaluate Two-Stage Causal Verification Gate.
 
         Args:
-            features: 1D feature array of shape (13,), FeaturePacket, or sequence of floats.
+            features: 1D feature array of shape (13 or 15,), FeaturePacket, or sequence of floats.
+            delta_p_obj: Causal objectness recovery metric from detector.py Pass 2 inpainting.
+            patch_roi: Optional candidate patch ROI [x1, y1, x2, y2].
+            patch_rois: Optional sequence of candidate patch ROIs.
+            person_bbox: Optional detected person bounding box [x1, y1, x2, y2].
+            recovered_objects_count: Number of suppressed objects recovered in Pass 2 inpainting.
+            conf_drop: Optional explicit drop in tracked person confidence.
+            max_grid_norm_ratio: Optional DPATCH grid norm ratio.
 
         Returns:
             AttackPrediction containing attack flag, probability, and top contributing features.
         """
-        # 1. Input normalization
+        # 1. Input normalization and contextual parameter extraction
         t_start = time.perf_counter()
+
+        resolved_person_bbox = person_bbox
+        resolved_delta_p_obj = float(delta_p_obj)
+        all_patch_rois: List[Sequence[float]] = []
+        if patch_roi is not None:
+            all_patch_rois.append(patch_roi)
+        if patch_rois:
+            all_patch_rois.extend(patch_rois)
 
         if isinstance(features, FeaturePacket):
             raw_vec = features.feature_vector
+            if resolved_person_bbox is None:
+                resolved_person_bbox = features.bbox
+            if resolved_delta_p_obj == 0.0:
+                resolved_delta_p_obj = float(getattr(features, "delta_p_obj", 0.0))
+            if not all_patch_rois and features.candidate_patch_rois:
+                all_patch_rois.extend(features.candidate_patch_rois)
+            if conf_drop is None and "conf_drop" in features.feature_dict:
+                conf_drop = float(features.feature_dict["conf_drop"])
+            if max_grid_norm_ratio is None and "max_grid_norm_ratio" in features.feature_dict:
+                max_grid_norm_ratio = float(features.feature_dict["max_grid_norm_ratio"])
         elif isinstance(features, np.ndarray):
             raw_vec = features.flatten()
         else:
             raw_vec = np.array(features, dtype=np.float32).flatten()
 
-        if len(raw_vec) != len(FEATURE_NAMES):
+        if len(raw_vec) not in (len(FEATURE_NAMES), 13):
             raise ValueError(
-                f"Feature vector length mismatch: expected {len(FEATURE_NAMES)} features, got {len(raw_vec)}."
+                f"Feature vector length mismatch: expected {len(FEATURE_NAMES)} or 13 features, got {len(raw_vec)}."
             )
 
         sanitized_vec = np.nan_to_num(raw_vec, nan=0.0, posinf=1.0, neginf=0.0).astype(np.float32)
         input_2d = sanitized_vec.reshape(1, -1)
 
+        # Ensure compatibility with pre-trained models expecting 13 features
+        expected_features = 13
+        if self.is_onnx:
+            in_shape = self.model.get_inputs()[0].shape
+            if len(in_shape) > 1 and isinstance(in_shape[1], int):
+                expected_features = in_shape[1]
+        elif hasattr(self.model, "n_features_in_"):
+            expected_features = self.model.n_features_in_
+
+        model_input = input_2d[:, :expected_features] if input_2d.shape[1] >= expected_features else input_2d
+
         # 2. Forward model inference
         if self.is_onnx:
             input_name = self.model.get_inputs()[0].name
-            ort_outs = self.model.run(None, {input_name: input_2d})
+            ort_outs = self.model.run(None, {input_name: model_input})
             # ONNX Scikit-Learn output: [labels, probabilities_dict or array]
             if len(ort_outs) > 1 and isinstance(ort_outs[1], list):
                 # Map of {0: p0, 1: p1}
@@ -213,18 +289,59 @@ class AttackClassifier:
                 p_clean = 1.0 - p_attack
         else:
             if hasattr(self.model, "predict_proba"):
-                probs = self.model.predict_proba(input_2d)[0]
+                probs = self.model.predict_proba(model_input)[0]
                 p_clean = float(probs[0])
                 p_attack = float(probs[1]) if len(probs) > 1 else float(1.0 - probs[0])
             else:
-                pred_label = int(self.model.predict(input_2d)[0])
+                pred_label = int(self.model.predict(model_input)[0])
                 p_attack = 1.0 if pred_label == 1 else 0.0
                 p_clean = 1.0 - p_attack
 
         t_elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 
-        # 3. Decision thresholding
-        is_attack = bool(p_attack >= self.threshold)
+        # Extract contextual causal verification attributes
+        if conf_drop is None:
+            resolved_conf_drop = float(sanitized_vec[1]) if len(sanitized_vec) > 1 else 0.0
+        else:
+            resolved_conf_drop = float(conf_drop)
+
+        if max_grid_norm_ratio is None:
+            resolved_norm_ratio = float(sanitized_vec[13]) if len(sanitized_vec) > 13 else 1.0
+        else:
+            resolved_norm_ratio = float(max_grid_norm_ratio)
+
+        has_conf_drop = bool(resolved_conf_drop >= 0.10)
+
+        resolved_recovered_count = int(recovered_objects_count)
+        if resolved_recovered_count == 0 and resolved_delta_p_obj >= 0.15:
+            resolved_recovered_count = 1
+
+        patch_in_person = self._check_patch_in_person(all_patch_rois, resolved_person_bbox)
+
+        # 3. Two-Stage Causal Verification Gate
+        # (a) Local Thys Attack Gate: The candidate patch ROI overlaps/lies inside a detected person bounding box
+        #     AND (delta_p_obj >= 0.15 after Pass 2 inpainting OR classifier_prob >= 0.85 with a drop in tracked person confidence).
+        local_thys_gate = bool(
+            patch_in_person and (
+                resolved_delta_p_obj >= 0.15 or (p_attack >= 0.85 and has_conf_drop)
+            )
+        )
+
+        # (b) Global DPATCH Gate: The candidate patch ROI exhibits max_grid_norm_ratio > 3.5
+        #     AND Pass 2 inpainting recovers >= 1 previously suppressed objects anywhere in the frame.
+        global_dpatch_gate = bool(
+            resolved_norm_ratio > 3.5 and resolved_recovered_count >= 1
+        )
+
+        causal_gate_passed = bool(local_thys_gate or global_dpatch_gate)
+
+        # An alert MUST NOT be flagged as is_attack = True based solely on classifier texture/gradient features
+        # if delta_p_obj is near zero.
+        # Confirm an adversarial attack (is_attack = True) only if the causal gate passes:
+        is_attack = bool(
+            (p_attack >= self.threshold or resolved_delta_p_obj >= 0.15)
+            and causal_gate_passed
+        )
 
         # 4. Explainability & Feature Contribution Attribution
         top_contributors = self._compute_feature_contributions(sanitized_vec)
@@ -236,6 +353,8 @@ class AttackClassifier:
             feature_importances=self.global_importances,
             top_contributing_features=top_contributors,
             inference_latency_ms=round(t_elapsed_ms, 4),
+            causal_verification_passed=causal_gate_passed,
+            delta_p_obj=round(resolved_delta_p_obj, 4),
         )
 
     def _compute_feature_contributions(self, feature_vec: np.ndarray) -> List[Tuple[str, float]]:
@@ -243,16 +362,19 @@ class AttackClassifier:
         contributions: List[Tuple[str, float]] = []
 
         for i, name in enumerate(FEATURE_NAMES):
+            if i >= len(feature_vec):
+                break
             val = float(feature_vec[i])
             mean_b, std_b = CLEAN_FEATURE_BASELINES.get(name, (0.5, 0.1))
             g_imp = self.global_importances.get(name, 1.0 / len(FEATURE_NAMES))
 
             # Features where higher values indicate an attack:
-            # (conf_drop, entropy, variance, flicker, area_stability)
+            # (conf_drop, entropy, variance, flicker, area_stability, DPATCH ratio, JPEG delta)
             if name in (
                 "conf_drop", "conf_std", "area_stability", "aspect_ratio_stability",
                 "flicker_rate", "laplacian_var_norm", "laplacian_entropy",
                 "color_hue_entropy", "color_sat_entropy", "color_val_entropy",
+                "max_grid_norm_ratio", "jpeg_recompression_delta",
             ):
                 deviation = max(0.0, (val - mean_b) / (std_b + 1e-4))
             elif name in ("conf_current", "mean_consecutive_iou", "min_consecutive_iou"):
@@ -271,6 +393,27 @@ class AttackClassifier:
     def predict_batch(
         self,
         feature_matrix: np.ndarray,
+        delta_p_objs: Optional[Sequence[float]] = None,
+        patch_rois_list: Optional[Sequence[Optional[Sequence[Sequence[float]]]]] = None,
+        person_bboxes: Optional[Sequence[Optional[Sequence[float]]]] = None,
+        recovered_counts: Optional[Sequence[int]] = None,
     ) -> List[AttackPrediction]:
-        """Perform batch prediction across multiple tracks."""
-        return [self.predict(vec) for vec in feature_matrix]
+        """Perform batch prediction across multiple tracks with optional causal context."""
+        results = []
+        n = len(feature_matrix)
+        for i in range(n):
+            vec = feature_matrix[i]
+            d_p = delta_p_objs[i] if delta_p_objs is not None and i < len(delta_p_objs) else 0.0
+            p_rois = patch_rois_list[i] if patch_rois_list is not None and i < len(patch_rois_list) else None
+            p_box = person_bboxes[i] if person_bboxes is not None and i < len(person_bboxes) else None
+            rec_cnt = recovered_counts[i] if recovered_counts is not None and i < len(recovered_counts) else 0
+            results.append(
+                self.predict(
+                    vec,
+                    delta_p_obj=d_p,
+                    patch_rois=p_rois,
+                    person_bbox=p_box,
+                    recovered_objects_count=rec_cnt,
+                )
+            )
+        return results

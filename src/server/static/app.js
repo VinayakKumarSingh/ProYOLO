@@ -101,8 +101,14 @@ function addAlertToFeed(alert) {
   const timeStr = alert.created_at ? alert.created_at.replace('T', ' ').slice(0, 19) : new Date().toLocaleTimeString();
   const thumbSrc = alert.thumbnail_b64 || generateSyntheticThumbnail(true);
 
+  const isRecovered = Boolean(alert.recovered_by_inpainting);
+  const deltaP = alert.delta_p_obj !== undefined && alert.delta_p_obj !== null ? Number(alert.delta_p_obj).toFixed(2) : '0.00';
+  const recoveryBadgeHtml = isRecovered
+    ? `<span class="feature-tag highlight" style="background: rgba(6, 182, 212, 0.25); color: #06b6d4; border: 1px solid #06b6d4; font-weight: 700;">🛡 RECOVERED (ΔP: +${deltaP})</span>`
+    : `<span class="feature-tag" style="background: rgba(148, 163, 184, 0.15); color: #94a3b8;">RAW TARGET</span>`;
+
   // Feature breakdown tags
-  let featureTagsHtml = '';
+  let featureTagsHtml = recoveryBadgeHtml;
   if (alert.top_features && typeof alert.top_features === 'object') {
     for (const [key, val] of Object.entries(alert.top_features)) {
       const formattedKey = key.replace(/_/g, ' ');
@@ -110,7 +116,7 @@ function addAlertToFeed(alert) {
       featureTagsHtml += `<span class="feature-tag highlight">${formattedKey}: ${formattedVal}</span>`;
     }
   } else {
-    featureTagsHtml = `
+    featureTagsHtml += `
       <span class="feature-tag highlight">HSV Val Entropy: +0.44</span>
       <span class="feature-tag highlight">Confidence Drop: +0.38</span>
       <span class="feature-tag">Laplacian Var: +0.28</span>
@@ -130,7 +136,7 @@ function addAlertToFeed(alert) {
         <div class="alert-thumbnail-overlay"></div>
       </div>
       <div class="alert-details">
-        <div class="alert-track-info">Attacker Detected (Adversarial Patch)</div>
+        <div class="alert-track-info">${isRecovered ? "Actively Recovered Target (Inpainting Mitigation)" : "Attacker Detected (Adversarial Patch)"}</div>
         <div class="alert-coords">Person Confidence: ${confPercent}% • BBox: ${bboxStr}</div>
         <div class="alert-features">${featureTagsHtml}</div>
       </div>
@@ -160,16 +166,20 @@ function addAlertToFeed(alert) {
 
 function openModal(alert, thumbSrc) {
   if (!elements.snapshotModal) return;
+  const isRecovered = Boolean(alert.recovered_by_inpainting);
+  const deltaP = alert.delta_p_obj !== undefined && alert.delta_p_obj !== null ? Number(alert.delta_p_obj).toFixed(2) : '0.00';
+
   elements.modalImg.src = thumbSrc;
   elements.modalDetails.innerHTML = `
     <div><strong>Classification:</strong> <span style="color: #ff2a5f; font-weight: 700;">ATTACKER</span> (Adversarial Optical Pattern Detected)</div>
+    <div><strong>Detection Status:</strong> ${isRecovered ? `<span style="color: #06b6d4; font-weight: 700;">ACTIVELY RECOVERED</span> (Inpainted Patch, Objectness Recovery ΔP_obj = +${deltaP})` : '<span style="color: #94a3b8; font-weight: 600;">RAW DETECTION</span>'}</div>
     <div><strong>Camera:</strong> ${alert.camera_id || 'CAM-01'}</div>
     <div><strong>Track ID:</strong> #${alert.track_id}</div>
     <div><strong>Attacker Probability:</strong> ${(alert.attack_probability * 100).toFixed(2)}%</div>
     <div><strong>Person Detection Confidence:</strong> ${(alert.confidence * 100).toFixed(2)}%</div>
     <div><strong>Bounding Box Coordinates:</strong> [${alert.bbox ? alert.bbox.join(', ') : '0, 0, 0, 0'}]</div>
     <div><strong>Timestamp:</strong> ${alert.created_at || new Date().toISOString()}</div>
-    <div style="margin-top: 8px;"><strong>Forensic Assessment:</strong> High spatial chromatic variance and high-frequency edge gradients detected on human chest area, causing sudden confidence attenuation in YOLOv8n backbone. Flagged for optical mitigation.</div>
+    <div style="margin-top: 8px;"><strong>Forensic Assessment:</strong> High spatial chromatic variance and high-frequency edge gradients detected on human torso, causing sudden confidence attenuation in YOLOv8n backbone. Flagged for optical mitigation and persistence verification.</div>
   `;
   elements.snapshotModal.classList.add('open');
 }

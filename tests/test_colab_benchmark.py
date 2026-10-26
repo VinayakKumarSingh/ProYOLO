@@ -28,6 +28,7 @@ from notebooks.colab_robustness_benchmark import (
     NonPrintabilityScoreLoss,
     PatternOptimizer,
     TotalVariationLoss,
+    evaluate_four_scenarios,
     seed_everything,
 )
 
@@ -191,6 +192,80 @@ class TestDefensiveDatasetBuilder:
             assert "pattern_bbox" in first_entry
             assert "confidence_delta" in first_entry
 
+    def test_build_four_split_dataset(self, tmp_path):
+        """Verifies dataset generation across all 4 paper-aligned test splits."""
+        pattern_file = tmp_path / "dummy_pattern.png"
+        dummy_img = (np.random.rand(100, 100, 3) * 255).astype(np.uint8)
+        import cv2
+        cv2.imwrite(str(pattern_file), dummy_img)
+
+        output_dataset_dir = tmp_path / "four_split_dataset"
+        builder = DefensiveDatasetBuilder(
+            output_dir=str(output_dataset_dir),
+            image_size=(320, 320),
+        )
+
+        summary = builder.build_four_split_dataset(
+            pattern_path=str(pattern_file),
+            num_samples_per_split=2,
+        )
+
+        assert summary["total_samples"] == 8
+        assert summary["clean_count"] == 4
+        assert summary["perturbed_count"] == 4
+        assert summary["scenario_counts"] == {1: 2, 2: 2, 3: 2, 4: 2}
+
+        # Check subdirectories
+        for split_name in ("clean", "benign_clothing", "thys_attack", "global_dpatch"):
+            split_dir = output_dataset_dir / "images" / split_name
+            assert split_dir.exists()
+            assert len(list(split_dir.glob("*.jpg"))) == 2
+
+        # Check annotations and metadata
+        assert os.path.exists(summary["annotations_json"])
+        assert os.path.exists(summary["metadata_csv"])
+        assert os.path.exists(summary["zip_archive"])
+
+        with open(summary["annotations_json"], "r", encoding="utf-8") as f:
+            data = json.load(f)
+            assert data["total_samples"] == 8
+            scenario_ids = [entry["scenario_id"] for entry in data["data"]]
+            assert set(scenario_ids) == {1, 2, 3, 4}
+
+
+class TestFourPaperAlignedBenchmark:
+    """Verifies four-split evaluation and defensive robustness metrics."""
+
+    def test_evaluate_four_scenarios_metrics(self):
+        """Ensure all paper-aligned metrics are asserted and satisfy criteria."""
+        metrics = evaluate_four_scenarios(num_samples_per_split=3)
+
+        # Assert all 5 required paper-aligned metrics exist
+        assert "clean_fpr" in metrics
+        assert "hard_negative_fpr" in metrics
+        assert "pass1_attack_recall" in metrics
+        assert "pass2_recovered_recall" in metrics
+        assert "mean_latency_ms" in metrics
+        assert "clean_person_recall" in metrics
+
+        # Scenario 1 (Clean Baseline)
+        assert 0.0 <= metrics["clean_fpr"] <= 0.05
+        assert metrics["clean_person_recall"] >= 0.85
+
+        # Scenario 2 (Hard-Negative Benign Clothing): FPR strictly < 2%
+        assert metrics["hard_negative_fpr"] < 0.02
+
+        # Scenario 3 (Local Thys et al. Torso Patch Attack): Recovery > raw attack recall
+        assert metrics["pass1_attack_recall"] < metrics["pass2_recovered_recall"]
+        assert metrics["pass2_recovered_recall"] >= 0.80
+
+        # Scenario 4 & End-to-End Latency
+        assert metrics["mean_latency_ms"] > 0.0
+        assert len(metrics["scenarios"]) == 4
+
+        scenario_ids = [s["scenario_id"] for s in metrics["scenarios"]]
+        assert scenario_ids == [1, 2, 3, 4]
+
 
 def test_deterministic_seeding():
     """Verifies seed_everything produces deterministic torch and random output."""
@@ -204,3 +279,4 @@ def test_deterministic_seeding():
 
     assert r1 == r2
     assert torch.equal(t1, t2)
+

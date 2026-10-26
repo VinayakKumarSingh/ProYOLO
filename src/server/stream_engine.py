@@ -55,12 +55,18 @@ class StreamEngine:
         threshold: float = 0.65,
         alert_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
         telemetry_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        redis_manager: Optional[Any] = None,
+        detector: Optional[Any] = None,
+        tracker: Optional[Any] = None,
+        feature_extractor: Optional[Any] = None,
+        classifier: Optional[Any] = None,
     ) -> None:
         self.camera_id = camera_id
         self.target_fps = target_fps
         self.threshold = threshold
         self.alert_callback = alert_callback
         self.telemetry_callback = telemetry_callback
+        self.redis_manager = redis_manager
 
         # Internal state
         self.current_source: Union[int, str] = source
@@ -75,17 +81,20 @@ class StreamEngine:
         self._fallback_frame_idx: int = 0
 
         # Initialize detector with CPU-optimized 384x384 resolution
-        model_p = Path(model_path)
-        if not model_p.exists():
-            data_model_p = Path(WORKSPACE_ROOT) / "data" / model_p.name
-            if data_model_p.exists():
-                model_p = data_model_p
-        self.detector = YOLOv8ONNXDetector(model_p, input_size=(384, 384), conf_threshold=0.35)
+        if detector is not None:
+            self.detector = detector
+        else:
+            model_p = Path(model_path)
+            if not model_p.exists():
+                data_model_p = Path(WORKSPACE_ROOT) / "data" / model_p.name
+                if data_model_p.exists():
+                    model_p = data_model_p
+            self.detector = YOLOv8ONNXDetector(model_p, input_size=(384, 384), conf_threshold=0.35)
 
         # Initialize tracker & defense models
-        self.tracker = ByteTracker(track_thresh=0.40, match_thresh=0.7)
-        self.feature_extractor = DualFeatureExtractor()
-        self.classifier = AttackClassifier(model_path=classifier_path, threshold=threshold)
+        self.tracker = tracker if tracker is not None else ByteTracker(track_thresh=0.40, match_thresh=0.7)
+        self.feature_extractor = feature_extractor if feature_extractor is not None else DualFeatureExtractor()
+        self.classifier = classifier if classifier is not None else AttackClassifier(model_path=classifier_path, threshold=threshold)
 
         # Open initial capture source
         self._open_capture(source)
@@ -203,16 +212,19 @@ class StreamEngine:
         frame: np.ndarray,
         timestamp: float,
     ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
-        """Execute full YOLOv8n + ByteTrack + Feature Extraction + Classifier pipeline."""
+        """Execute full YOLOv8 Active Two-Pass + ByteTrack + Feature Extraction + Classifier pipeline."""
         t0 = time.perf_counter()
         display_frame = frame.copy()
         h_img, w_img = frame.shape[:2]
 
-        # 1. Object Detection (YOLOv8n CPU)
-        detections = self.detector.detect(frame)
+        # 1. Object Detection with Active Two-Pass Inpainting Recovery
+        if hasattr(self.detector, "detect_with_recovery"):
+            detections = self.detector.detect_with_recovery(frame, conf_thresh=0.40, low_conf_thresh=0.12)
+        else:
+            detections = self.detector.detect(frame)
         person_detections = [d for d in detections if d.class_id == 0]
 
-        # 2. Multi-Object Tracking (ByteTrack)
+        # 2. Multi-Object Tracking (ByteTrack with dual-threshold association)
         active_tracks = self.tracker.update(person_detections)
 
         telemetry_items: List[Dict[str, Any]] = []
@@ -222,24 +234,41 @@ class StreamEngine:
             prediction: AttackPrediction = self.classifier.predict(feat_packet)
 
             is_threat = prediction.is_attack
+            # Enforce temporal persistence: K=3 out of N=5 consecutive frames
+            confirmed_alert = track.record_attack_prediction(is_threat)
             prob = float(prediction.attack_probability)
             conf = float(track.latest_confidence)
             bbox = [float(v) for v in track.latest_bbox]
+            recovered_by_inpainting = bool(getattr(track, "recovered_by_inpainting", False))
+            delta_p_obj = float(getattr(track, "delta_p_obj", 0.0))
 
             item = {
                 "track_id": track.track_id,
-                "label": "Attacker" if is_threat else "Person",
+                "label": "Attacker" if confirmed_alert else ("Suspect" if is_threat else "Person"),
                 "bbox": bbox,
                 "confidence": round(conf, 3),
                 "is_attack": is_threat,
+                "confirmed_attack_alert": confirmed_alert,
                 "attack_probability": round(prob, 3),
+                "recovered_by_inpainting": recovered_by_inpainting,
+                "delta_p_obj": round(delta_p_obj, 3),
             }
             telemetry_items.append(item)
 
-            # Draw Real Annotations (Person / Attacker)
-            self._draw_detection_box(display_frame, track.track_id, bbox, conf, is_threat, prob)
+            # Draw Real Annotations (Person / Attacker / Inpainting Recovered)
+            self._draw_detection_box(
+                display_frame,
+                track.track_id,
+                bbox,
+                conf,
+                confirmed_alert,
+                prob,
+                recovered_by_inpainting=recovered_by_inpainting,
+                delta_p_obj=delta_p_obj,
+            )
 
-            if is_threat:
+            # Only fire alerts when confirmed by temporal persistence (K=3 / N=5)
+            if confirmed_alert:
                 self.total_attacks_flagged += 1
 
                 # Generate base64 thumbnail crop
@@ -261,7 +290,17 @@ class StreamEngine:
                     "timestamp": timestamp,
                     "thumbnail_b64": thumb_b64,
                     "top_features": dict(prediction.top_contributing_features),
+                    "confirmed_attack_alert": True,
+                    "recovered_by_inpainting": recovered_by_inpainting,
+                    "delta_p_obj": round(delta_p_obj, 4),
                 }
+
+                # Publish to Redis Manager if configured
+                if hasattr(self, "redis_manager") and self.redis_manager is not None:
+                    try:
+                        self.redis_manager.publish_alert(alert_data)
+                    except Exception as exc:
+                        logger.debug("Redis alert publish error: %s", exc)
 
                 if self.alert_callback:
                     try:
@@ -318,6 +357,8 @@ class StreamEngine:
         conf: float,
         is_attack: bool,
         prob: float,
+        recovered_by_inpainting: bool = False,
+        delta_p_obj: float = 0.0,
     ) -> None:
         """Render annotated bounding boxes and threat labels on display frame."""
         x1, y1, x2, y2 = [int(v) for v in bbox]
@@ -327,6 +368,11 @@ class StreamEngine:
             thick = 3
             label = f"Attacker #{track_id} ({prob * 100:.0f}%)"
             badge_color = (95, 42, 255)
+        elif recovered_by_inpainting:
+            color = (212, 182, 6)  # Cyan/Teal in BGR for Inpainting Recovered
+            thick = 2
+            label = f"Recovered #{track_id} ({conf * 100:.0f}% ΔP={delta_p_obj:+.2f})"
+            badge_color = (212, 182, 6)
         else:
             color = (129, 185, 16)  # Emerald Green in BGR
             thick = 2

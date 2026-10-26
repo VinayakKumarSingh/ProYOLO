@@ -31,67 +31,17 @@ if WORKSPACE_ROOT not in sys.path:
     sys.path.insert(0, WORKSPACE_ROOT)
 
 from src.classifier.attack_classifier import AttackClassifier, AttackPrediction
-from src.detection.detector import Detection, YOLOv8ONNXDetector
+from src.detection.detector import (
+    Detection,
+    UltralyticsPyTorchWrapper,
+    YOLOv8ONNXDetector,
+)
 from src.detection.feature_extractor import DualFeatureExtractor
 from src.detection.tracker import ByteTracker, Track
 from src.pipeline.redis_manager import RedisManager
 from src.pipeline.stream_ingestion import StreamIngestor
 
 logger = logging.getLogger("proyolo.main")
-
-
-class UltralyticsPyTorchWrapper:
-    """Wrapper for PyTorch (.pt) weights using Ultralytics with CPU execution."""
-
-    def __init__(
-        self,
-        model_path: Union[str, Path],
-        conf_threshold: float = 0.25,
-        iou_threshold: float = 0.45,
-    ) -> None:
-        try:
-            from ultralytics import YOLO
-        except ImportError as exc:
-            raise ImportError(
-                "ultralytics is required to run .pt models. Please install it."
-            ) from exc
-
-        self.model = YOLO(str(model_path))
-        self.conf_threshold = conf_threshold
-        self.iou_threshold = iou_threshold
-
-    def detect(self, image: np.ndarray) -> List[Detection]:
-        """Execute detection using Ultralytics PyTorch model on CPU."""
-        results = self.model.predict(
-            source=image,
-            conf=self.conf_threshold,
-            iou=self.iou_threshold,
-            classes=[0],  # Person class only
-            device="cpu",
-            verbose=False,
-        )
-        detections: List[Detection] = []
-        if not results:
-            return detections
-
-        boxes = results[0].boxes
-        if boxes is None or len(boxes) == 0:
-            return detections
-
-        xyxy = boxes.xyxy.cpu().numpy()
-        confs = boxes.conf.cpu().numpy()
-        cls_ids = boxes.cls.cpu().numpy()
-
-        for box, conf, cid in zip(xyxy, confs, cls_ids):
-            detections.append(
-                Detection(
-                    bbox=box.astype(np.float32),
-                    confidence=float(conf),
-                    class_id=int(cid),
-                    class_name="person",
-                )
-            )
-        return detections
 
 
 def create_detector(
@@ -223,7 +173,7 @@ class ProYOLOPipeline:
 
         # 2. Initialize Models
         self.detector = create_detector(model_path)
-        self.tracker = ByteTracker(track_thresh=0.45, match_thresh=0.7)
+        self.tracker = ByteTracker(track_thresh=0.40, low_thresh=0.12, match_thresh=0.7)
         self.feature_extractor = DualFeatureExtractor()
         self.classifier = AttackClassifier(model_path=classifier_path, threshold=threshold)
 
@@ -266,11 +216,14 @@ class ProYOLOPipeline:
         """
         t0 = time.perf_counter()
 
-        # Step 1: Detect Persons
-        detections = self.detector.detect(frame)
+        # Step 1: Detect Persons with Active Two-Pass Inpainting Recovery
+        if hasattr(self.detector, "detect_with_recovery"):
+            detections = self.detector.detect_with_recovery(frame, conf_thresh=0.40, low_conf_thresh=0.12)
+        else:
+            detections = self.detector.detect(frame)
         person_detections = [d for d in detections if d.class_id == 0]
 
-        # Step 2: Multi-Object Tracking (ByteTrack)
+        # Step 2: Multi-Object Tracking (ByteTrack with dual-threshold association)
         active_tracks = self.tracker.update(person_detections)
 
         # Step 3: Dual Feature Extraction & Attack Classification
@@ -282,23 +235,30 @@ class ProYOLOPipeline:
             prediction: AttackPrediction = self.classifier.predict(feat_packet)
 
             is_threat = prediction.is_attack
+            confirmed_alert = track.record_attack_prediction(is_threat)
             prob = float(prediction.attack_probability)
             conf = float(track.latest_confidence)
             bbox = [float(v) for v in track.latest_bbox]
+            recovered_by_inpainting = bool(getattr(track, "recovered_by_inpainting", False))
+            delta_p_obj = float(getattr(track, "delta_p_obj", 0.0))
 
             item = {
                 "track_id": track.track_id,
                 "bbox": bbox,
                 "confidence": round(conf, 3),
                 "is_attack": is_threat,
+                "confirmed_attack_alert": confirmed_alert,
                 "attack_probability": round(prob, 3),
+                "recovered_by_inpainting": recovered_by_inpainting,
+                "delta_p_obj": round(delta_p_obj, 3),
             }
             telemetry_items.append(item)
 
-            if is_threat:
+            # Enforce temporal persistence: K=3 out of N=5 consecutive frames
+            if confirmed_alert:
                 self.total_attacks_flagged += 1
                 logger.warning(
-                    "🚨 PHYSICAL ADVERSARIAL ATTACK FLAGGED on Track #%d (P=%.2f, Conf=%.2f)",
+                    "🚨 CONFIRMED PHYSICAL ADVERSARIAL ATTACK on Track #%d (P=%.2f, Conf=%.2f, K=3/5 persistence)",
                     track.track_id,
                     prob,
                     conf,
@@ -314,8 +274,28 @@ class ProYOLOPipeline:
                     if ok:
                         thumb_b64 = "data:image/jpeg;base64," + base64.b64encode(buf).decode("utf-8")
 
-                # Dispatch Alert to Backend
+                # Dispatch Alert to Redis Manager and Backend
                 top_features = dict(prediction.top_contributing_features)
+                alert_payload = {
+                    "camera_id": self.camera_id,
+                    "track_id": track.track_id,
+                    "confidence": conf,
+                    "attack_probability": prob,
+                    "bbox": bbox,
+                    "timestamp": timestamp,
+                    "thumbnail_b64": thumb_b64,
+                    "top_features": top_features,
+                    "confirmed_attack_alert": True,
+                    "recovered_by_inpainting": recovered_by_inpainting,
+                    "delta_p_obj": round(delta_p_obj, 4),
+                }
+
+                if hasattr(self, "redis_manager") and self.redis_manager is not None:
+                    try:
+                        self.redis_manager.publish_alert(alert_payload)
+                    except Exception as exc:
+                        logger.debug("Redis alert publish error: %s", exc)
+
                 self.dispatcher.dispatch_alert(
                     camera_id=self.camera_id,
                     track_id=track.track_id,
@@ -329,7 +309,16 @@ class ProYOLOPipeline:
 
             # Draw annotations if GUI is active
             if not self.headless:
-                self._draw_box(display_frame, track.track_id, bbox, conf, is_threat, prob)
+                self._draw_box(
+                    display_frame,
+                    track.track_id,
+                    bbox,
+                    conf,
+                    confirmed_alert,
+                    prob,
+                    recovered_by_inpainting=recovered_by_inpainting,
+                    delta_p_obj=delta_p_obj,
+                )
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         self.recent_latencies.append(elapsed_ms)
@@ -358,6 +347,8 @@ class ProYOLOPipeline:
         conf: float,
         is_attack: bool,
         prob: float,
+        recovered_by_inpainting: bool = False,
+        delta_p_obj: float = 0.0,
     ) -> None:
         """Render annotated bounding boxes and threat labels on display frame."""
         x1, y1, x2, y2 = [int(v) for v in bbox]
@@ -366,6 +357,10 @@ class ProYOLOPipeline:
             color = (95, 42, 255)  # Crimson Red in BGR
             thick = 3
             label = f"Attacker #{track_id} ({prob * 100:.0f}%)"
+        elif recovered_by_inpainting:
+            color = (212, 182, 6)  # Cyan/Teal in BGR
+            thick = 2
+            label = f"Recovered #{track_id} ({conf * 100:.0f}% ΔP={delta_p_obj:+.2f})"
         else:
             color = (129, 185, 16)  # Emerald Green in BGR
             thick = 2

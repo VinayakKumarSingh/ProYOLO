@@ -257,6 +257,25 @@ class RedisManager:
         except Exception:
             return False
 
+    def publish_alert(self, alert_payload: Dict[str, Any], channel: str = "attack_alerts") -> bool:
+        """Publish an attack alert JSON payload to a Redis pub/sub channel.
+
+        Args:
+            alert_payload: Dictionary containing confirmed attack alert details.
+            channel: Redis pub/sub channel name (default: 'attack_alerts').
+
+        Returns:
+            True if published successfully, False otherwise.
+        """
+        try:
+            payload_str = json.dumps(alert_payload)
+            if hasattr(self.client, "publish"):
+                self.client.publish(channel, payload_str)
+            return True
+        except Exception as exc:
+            logger.debug("Failed to publish alert to Redis channel %s: %s", channel, exc)
+            return False
+
     def close(self) -> None:
         """Close connection to Redis."""
         try:

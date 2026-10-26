@@ -19,6 +19,7 @@ import pytest
 
 from src.classifier.attack_classifier import AttackClassifier, AttackPrediction
 from src.classifier.train_classifier import (
+    HardNegativePatchApplier,
     generate_synthetic_features,
     train_and_benchmark_models,
 )
@@ -153,6 +154,110 @@ class TestAttackClassifierAccuracyAndAlerts:
         assert len(preds) == 2
         assert preds[0].is_attack is False
         assert preds[1].is_attack is True
+
+    def test_benign_checkerboard_vs_adversarial_suppression(self, classifier):
+        """Verifies two-stage causal verification gate:
+
+        1. A high-contrast benign checkerboard pattern on a person with delta_p_obj = 0.0
+           must NOT trigger an attack alert (is_attack = False).
+        2. An objectness-suppressing patch with delta_p_obj = 0.35
+           must trigger an attack alert (is_attack = True).
+        """
+        person_bbox = [100.0, 100.0, 250.0, 450.0]
+        patch_roi = [130.0, 160.0, 220.0, 250.0]
+
+        # 1. Benign checkerboard pattern on person:
+        # High texture/gradient/color entropy, but stable detection (conf_current=0.92, conf_drop=0.01)
+        # and no recovery from Pass 2 inpainting (delta_p_obj=0.0).
+        benign_checkerboard_vec = np.array(
+            [
+                0.92,  # conf_current: detected normally
+                0.01,  # conf_drop: no confidence drop
+                0.02,  # conf_std
+                0.02,  # area_stability
+                0.02,  # aspect_ratio_stability
+                0.95,  # mean_consecutive_iou
+                0.90,  # min_consecutive_iou
+                0.0,   # flicker_rate
+                0.86,  # laplacian_var_norm: high due to checkerboard edges
+                0.89,  # laplacian_entropy: high due to checkerboard pattern
+                0.82,  # color_hue_entropy: high contrast
+                0.80,  # color_sat_entropy
+                0.78,  # color_val_entropy
+                1.5,   # max_grid_norm_ratio: normal
+                1.1,   # jpeg_recompression_delta: normal
+            ],
+            dtype=np.float32,
+        )
+
+        pred_benign = classifier.predict(
+            benign_checkerboard_vec,
+            delta_p_obj=0.0,
+            patch_roi=patch_roi,
+            person_bbox=person_bbox,
+        )
+        assert isinstance(pred_benign, AttackPrediction)
+        assert pred_benign.is_attack is False, (
+            f"Expected is_attack=False for benign checkerboard with delta_p_obj=0.0, got: {pred_benign}"
+        )
+        assert pred_benign.causal_verification_passed is False
+
+        # 2. Objectness-suppressing adversarial patch on person:
+        # Suppressed detection (conf_current=0.25, conf_drop=0.68) and Pass 2 inpainting recovery (delta_p_obj=0.35).
+        suppressing_patch_vec = np.array(
+            [
+                0.25,  # conf_current: suppressed
+                0.68,  # conf_drop: huge confidence drop
+                0.35,  # conf_std
+                0.45,  # area_stability
+                0.40,  # aspect_ratio_stability
+                0.45,  # mean_consecutive_iou
+                0.20,  # min_consecutive_iou
+                0.25,  # flicker_rate
+                0.85,  # laplacian_var_norm
+                0.90,  # laplacian_entropy
+                0.85,  # color_hue_entropy
+                0.80,  # color_sat_entropy
+                0.80,  # color_val_entropy
+                2.5,   # max_grid_norm_ratio
+                2.8,   # jpeg_recompression_delta
+            ],
+            dtype=np.float32,
+        )
+
+        pred_attack = classifier.predict(
+            suppressing_patch_vec,
+            delta_p_obj=0.35,
+            patch_roi=patch_roi,
+            person_bbox=person_bbox,
+        )
+        assert isinstance(pred_attack, AttackPrediction)
+        assert pred_attack.is_attack is True, (
+            f"Expected is_attack=True for suppressing patch with delta_p_obj=0.35, got: {pred_attack}"
+        )
+        assert pred_attack.causal_verification_passed is True
+        assert pred_attack.delta_p_obj == 0.35
+
+    def test_hard_negative_patch_applier(self):
+        """Test HardNegativePatchApplier pattern generation and EOT augmentation."""
+        import cv2
+
+        applier = HardNegativePatchApplier(seed=42)
+        checker = applier.generate_checkerboard(80, 80)
+        assert checker.shape == (80, 80, 3)
+        stripes = applier.generate_stripes(80, 80)
+        assert stripes.shape == (80, 80, 3)
+        qr = applier.generate_qr_like(80, 80)
+        assert qr.shape == (80, 80, 3)
+        text_box = applier.generate_text_box(80, 80)
+        assert text_box.shape == (80, 80, 3)
+
+        dummy_img = np.zeros((300, 300, 3), dtype=np.uint8)
+        pbox = [50.0, 50.0, 200.0, 280.0]
+        aug_img, roi = applier.apply(dummy_img, pbox)
+        assert aug_img.shape == (300, 300, 3)
+        assert len(roi) == 4
+        assert roi[0] >= pbox[0] and roi[2] <= pbox[2]
 
 
 class TestTrainingAndCrossValidation:

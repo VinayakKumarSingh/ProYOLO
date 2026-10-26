@@ -176,6 +176,13 @@ class Track:
         self.hit_streak = 1
         self.age = 1
 
+        self.delta_p_obj: float = float(getattr(detection, "delta_p_obj", 0.0))
+        self.recovered_by_inpainting: bool = bool(getattr(detection, "recovered_by_inpainting", False))
+
+        # Rolling deque (maxlen=5) for attack predictions & alert confirmation (K=3/N=5)
+        self.attack_history: Deque[bool] = deque(maxlen=5)
+        self._confirmed_attack_alert: Optional[bool] = None
+
         # Track history deque: last N frames
         self.history: Deque[TrackRecord] = deque(maxlen=max_history)
         self._record_history(detection.bbox, detection.confidence, frame_idx)
@@ -205,14 +212,39 @@ class Track:
         return predicted_box
 
     def update(self, detection: Detection, frame_idx: int) -> None:
-        """Update track state with a matched detection."""
+        """Update track state with a matched detection and record Kalman-smoothed bounding box."""
         self.time_since_update = 0
         self.hits += 1
         self.hit_streak += 1
         self.state = TrackState.Tracked
         self.is_activated = True
+        self.delta_p_obj = float(getattr(detection, "delta_p_obj", 0.0))
+        self.recovered_by_inpainting = bool(getattr(detection, "recovered_by_inpainting", False))
         self.kf.update(detection.bbox)
-        self._record_history(detection.bbox, detection.confidence, frame_idx)
+        # Use Kalman filter state estimate to produce smoothed bounding box resistant to patch suppression
+        smoothed_box = self.kf.get_bbox()
+        self._record_history(smoothed_box, detection.confidence, frame_idx)
+
+    def record_attack_prediction(self, is_attack: bool) -> bool:
+        """Record an attack prediction in rolling history (maxlen=5) and evaluate K=3 persistence.
+
+        Only sets confirmed_attack_alert = True when is_attack == True in at least
+        K=3 out of N=5 consecutive frames.
+        """
+        self.attack_history.append(bool(is_attack))
+        self._confirmed_attack_alert = bool(sum(self.attack_history) >= 3)
+        return self._confirmed_attack_alert
+
+    @property
+    def confirmed_attack_alert(self) -> bool:
+        """True when the track registers is_attack in at least K=3 out of N=5 consecutive frames."""
+        if self._confirmed_attack_alert is not None:
+            return self._confirmed_attack_alert
+        return bool(sum(self.attack_history) >= 3)
+
+    @confirmed_attack_alert.setter
+    def confirmed_attack_alert(self, value: bool) -> None:
+        self._confirmed_attack_alert = bool(value)
 
     def mark_missed(self) -> None:
         """Mark track as missed in current frame."""
@@ -298,18 +330,24 @@ class Track:
 class ByteTracker:
     """CPU-friendly ByteTrack Multi-Object Tracker.
 
-    Integrates low-confidence detection matching to maintain track continuity
-    during physical patch occlusion and suppression attacks.
+    Implements dual-threshold association to maintain track continuity
+    during physical patch occlusion and objectness suppression attacks:
+    - Tier 1: Associates high-confidence person detections (conf >= 0.40, including Pass 2 recovered boxes).
+    - Tier 2: Associates unmatched tracklets with low-confidence detections (0.12 <= conf < 0.40)
+      using Kalman filter state predictions, keeping partially suppressed persons alive with smoothed boxes.
+    - Temporal persistence: Enforces K=3 out of N=5 consecutive frame alert confirmation.
     """
 
     def __init__(
         self,
-        track_thresh: float = 0.5,
+        track_thresh: float = 0.40,
+        low_thresh: float = 0.12,
         match_thresh: float = 0.7,
         track_buffer: int = 30,
         max_history: int = 10,
     ) -> None:
         self.track_thresh = track_thresh
+        self.low_thresh = low_thresh
         self.match_thresh = match_thresh
         self.track_buffer = track_buffer
         self.max_history = max_history
@@ -317,6 +355,28 @@ class ByteTracker:
         self.tracked_tracks: List[Track] = []
         self.lost_tracks: List[Track] = []
         self.frame_idx = 0
+
+        # Rolling deques (maxlen=5) for attack predictions & alert confirmation (K=3/N=5)
+        self.attack_history: Deque[bool] = deque(maxlen=5)
+        self.dpatch_attack_history: Deque[bool] = deque(maxlen=5)
+        self._confirmed_dpatch_alert: Optional[bool] = None
+
+    def record_dpatch_attack(self, is_attack: bool) -> bool:
+        """Record a global background DPATCH candidate alert in rolling deque (maxlen=5)."""
+        self.dpatch_attack_history.append(bool(is_attack))
+        self.attack_history.append(bool(is_attack))
+        self._confirmed_dpatch_alert = bool(sum(self.dpatch_attack_history) >= 3)
+        return self._confirmed_dpatch_alert
+
+    @property
+    def confirmed_attack_alert(self) -> bool:
+        """True when any active track or the global DPATCH deque has K=3/5 confirmed alerts."""
+        if self._confirmed_dpatch_alert:
+            return True
+        return bool(
+            sum(self.dpatch_attack_history) >= 3
+            or any(t.confirmed_attack_alert for t in self.tracked_tracks)
+        )
 
     def update(
         self,
@@ -337,22 +397,24 @@ class ByteTracker:
         else:
             self.frame_idx += 1
 
-        # 1. Partition detections into high and low confidence
+        # 1. Dual-threshold partitioning:
+        # High confidence (conf >= 0.40) and low confidence (0.12 <= conf < 0.40)
         high_dets: List[Detection] = []
         low_dets: List[Detection] = []
         for det in detections:
             if det.confidence >= self.track_thresh:
                 high_dets.append(det)
-            elif det.confidence >= 0.10:
+            elif det.confidence >= self.low_thresh:
                 low_dets.append(det)
 
-        # 2. Advance Kalman Filter state for all existing tracks
+        # 2. Advance Kalman Filter state predictions for all existing tracks
         for trk in self.tracked_tracks:
             trk.predict()
         for trk in self.lost_tracks:
             trk.predict()
 
         # 3. First Association: Match active tracks with HIGH confidence detections
+        # (Includes Pass 2 actively recovered person boxes)
         pool_tracks = self.tracked_tracks + self.lost_tracks
         matched_tracks_1, unmatched_tracks_1, unmatched_dets_1 = self._associate(
             pool_tracks, high_dets, self.match_thresh
@@ -366,6 +428,8 @@ class ByteTracker:
                 self.tracked_tracks.append(trk)
 
         # 4. Second Association: Match remaining tracks with LOW confidence detections (ByteTrack)
+        # using Kalman filter state predictions to keep partially suppressed persons (0.12 <= conf < 0.40)
+        # alive during adversarial patch suppression or pose changes, outputting smoothed bounding boxes.
         matched_tracks_2, unmatched_tracks_2, _ = self._associate(
             unmatched_tracks_1, low_dets, self.match_thresh
         )
@@ -408,11 +472,12 @@ class ByteTracker:
         detections: List[Detection],
         threshold: float,
     ) -> Tuple[List[Tuple[Track, Detection]], List[Track], List[Detection]]:
-        """Perform bipartite matching using Hungarian algorithm with IoU distance."""
+        """Perform bipartite matching using Hungarian algorithm with IoU distance on Kalman state predictions."""
         if len(tracks) == 0 or len(detections) == 0:
             return [], tracks.copy(), detections.copy()
 
-        track_boxes = np.array([t.latest_bbox for t in tracks], dtype=np.float32)
+        # Use Kalman filter state predictions for robust spatial association
+        track_boxes = np.array([t.kf.get_bbox() for t in tracks], dtype=np.float32)
         det_boxes = np.array([d.bbox for d in detections], dtype=np.float32)
 
         cost_mat = iou_distance_matrix(track_boxes, det_boxes)

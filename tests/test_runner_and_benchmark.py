@@ -25,10 +25,12 @@ from src.evaluation.benchmark import (
     BenchmarkReportData,
     ConditionResult,
     RobustnessBenchmark,
+    ScenarioResult,
     apply_angle_transform,
     apply_cctv_conditions,
     apply_distance_transform,
     apply_illumination_transform,
+    generate_scenario_sample,
     generate_synthetic_sample,
 )
 from src.main import (
@@ -281,3 +283,56 @@ class TestRobustnessBenchmark:
         assert "Without Defense (Vanilla YOLO)" in md_content
         assert "With ProYOLO Defense" in md_content
         assert "14.9 FPS" in md_content
+
+    def test_evaluate_four_scenarios_and_metrics(self, tmp_path):
+        """Verify evaluation across 4 paper-aligned test splits and all required metrics."""
+        bench = RobustnessBenchmark(
+            model_path="yolov8n.onnx",
+            classifier_path="models/attack_classifier.joblib",
+            threshold=0.65,
+        )
+        report = bench.run_all(
+            num_samples_per_class=4,
+            output_dir=tmp_path / "reports",
+            run_condition_matrix=False,
+        )
+
+        # Assert all 5 required paper-aligned metrics exist and satisfy criteria
+        assert hasattr(report, "clean_fpr")
+        assert hasattr(report, "hard_negative_fpr")
+        assert hasattr(report, "pass1_attack_recall")
+        assert hasattr(report, "pass2_recovered_recall")
+        assert hasattr(report, "mean_latency_ms")
+
+        # Scenario 1 (Clean Baseline)
+        assert 0.0 <= report.clean_fpr <= 0.05
+        assert report.clean_person_recall >= 0.85
+
+        # Scenario 2 (Hard-Negative Benign Clothing): FPR strictly < 2%
+        assert report.hard_negative_fpr < 0.02
+
+        # Scenario 3 (Local Thys et al. Torso Patch Attack): Pass 2 recovered recall > Pass 1 raw attack recall
+        assert report.pass1_attack_recall < report.pass2_recovered_recall
+        assert report.pass2_recovered_recall >= 0.80
+
+        # Scenario 4 & End-to-End Latency
+        assert report.mean_latency_ms > 0.0
+        assert len(report.scenario_results) == 4
+
+        # Verify CSV and Markdown reports contain 4 scenarios
+        csv_file = tmp_path / "reports" / "benchmark_report.csv"
+        md_file = tmp_path / "reports" / "benchmark_report.md"
+        assert csv_file.exists()
+        assert md_file.exists()
+
+        csv_text = csv_file.read_text(encoding="utf-8")
+        assert "Scenario 1: Clean Baseline" in csv_text
+        assert "Scenario 2: Hard-Negative Benign Clothing" in csv_text
+        assert "Scenario 3: Local Thys et al. Torso Patch Attack" in csv_text
+        assert "Scenario 4: Global DPATCH Attack" in csv_text
+
+        md_text = md_file.read_text(encoding="utf-8")
+        assert "Four Paper-Aligned Test Splits Evaluation" in md_text
+        assert "Hard-Negative Benign Clothing" in md_text
+        assert "Local Thys et al. Torso Patch Attack" in md_text
+        assert "Global DPATCH Attack" in md_text

@@ -128,6 +128,37 @@ class TestRedisManager:
         assert jpeg_bytes[:2] == b"\xff\xd8", "Payload does not start with JPEG SOI marker"
         assert jpeg_bytes[-2:] == b"\xff\xd9", "Payload does not end with JPEG EOI marker"
 
+    def test_publish_alert(self, redis_manager):
+        """Verify publish_alert publishes JSON payload to the specified Redis pub/sub channel."""
+        pubsub = redis_manager.client.pubsub()
+        pubsub.subscribe("attack_alerts")
+        msg = pubsub.get_message(timeout=1.0)
+        assert msg is not None and msg["type"] == "subscribe"
+
+        alert_payload = {
+            "camera_id": "cam_01",
+            "track_id": 12,
+            "attack_probability": 0.94,
+            "recovered_by_inpainting": True,
+            "delta_p_obj": 0.28,
+        }
+        res = redis_manager.publish_alert(alert_payload, channel="attack_alerts")
+        assert res is True
+
+        msg2 = pubsub.get_message(timeout=1.0)
+        assert msg2 is not None
+        assert msg2["type"] == "message"
+        received_data = json.loads(msg2["data"])
+        assert received_data["track_id"] == 12
+        assert received_data["recovered_by_inpainting"] is True
+        assert pytest.approx(received_data["delta_p_obj"]) == 0.28
+
+    def test_publish_alert_resilience(self, redis_manager):
+        """Verify publish_alert handles exceptions gracefully without raising."""
+        with patch.object(redis_manager.client, "publish", side_effect=RuntimeError("Redis error")):
+            res = redis_manager.publish_alert({"track_id": 99})
+            assert res is False
+
     def test_queue_size_capping_drops_oldest(self, mock_redis, sample_bgr_frame):
         """Verify queue length never exceeds max_queue_size and oldest frames are dropped."""
         max_size = 5
