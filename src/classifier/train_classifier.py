@@ -23,7 +23,7 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import time
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 # Ensure workspace root is in sys.path
 WORKSPACE_ROOT = str(Path(__file__).resolve().parent.parent.parent)
