@@ -72,11 +72,13 @@ class SpatialFeatureNormClipper:
         quality: int = 75,
         target_layer: Optional[Union[nn.Module, int, str]] = None,
         image_size: Tuple[int, int] = (640, 640),
+        border_margin: float = 0.06,
     ) -> None:
         self.alpha = float(alpha)
         self.quality = int(quality)
         self.target_layer = target_layer
         self.image_size = image_size
+        self.border_margin = float(border_margin)
         self.hook_handle: Optional[torch.utils.hooks.RemovableHandle] = None
         self.current_image: Optional[np.ndarray] = None
 
@@ -210,47 +212,84 @@ class SpatialFeatureNormClipper:
         merged_heatmap: np.ndarray,
         min_area: float = 16.0,
     ) -> List[List[float]]:
-        """Extract candidate patch ROIs [x1, y1, x2, y2] from merged heatmap."""
+        """Extract candidate patch ROIs [x1, y1, x2, y2] from merged heatmap.
+
+        Masks out the outer 6% border of the frame before thresholding contours, and rejects
+        any candidate patch_roi whose center lies within 6% of the frame edge or touches
+        x1 <= 5, y1 <= 5, x2 >= W - 5, or y2 >= H - 5.
+        """
         if merged_heatmap is None or merged_heatmap.size == 0:
             return []
 
-        max_val = float(np.max(merged_heatmap))
+        h, w = merged_heatmap.shape[:2]
+        heatmap = merged_heatmap.copy()
+
+        # Mask out outer 6% border of the frame before thresholding contours
+        top_m = int(0.06 * h)
+        bot_m = int(0.94 * h)
+        left_m = int(0.06 * w)
+        right_m = int(0.94 * w)
+
+        heatmap[0:top_m, :] = 0.0
+        heatmap[bot_m:h, :] = 0.0
+        heatmap[:, 0:left_m] = 0.0
+        heatmap[:, right_m:w] = 0.0
+
+        max_val = float(np.max(heatmap))
         if max_val <= 1e-4:
             return []
 
-        norm_map = merged_heatmap / max_val
+        norm_map = heatmap / max_val
         thresh = (norm_map >= 0.25).astype(np.uint8) * 255
 
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        rois: List[List[float]] = []
+        raw_rois: List[List[float]] = []
 
         for cnt in contours:
             if cv2.contourArea(cnt) >= min_area:
-                x, y, w, h = cv2.boundingRect(cnt)
-                rois.append([float(x), float(y), float(x + w), float(y + h)])
+                x, y, cw, ch = cv2.boundingRect(cnt)
+                raw_rois.append([float(x), float(y), float(x + cw), float(y + ch)])
 
-        if not rois:
+        if not raw_rois:
             ys, xs = np.where(norm_map >= 0.25)
             if len(xs) > 0:
-                rois.append([
+                raw_rois.append([
                     float(np.min(xs)),
                     float(np.min(ys)),
                     float(np.max(xs) + 1),
                     float(np.max(ys) + 1),
                 ])
 
-        rois.sort(key=lambda r: (r[2] - r[0]) * (r[3] - r[1]), reverse=True)
-        return rois
+        filtered_rois: List[List[float]] = []
+        for roi in raw_rois:
+            x1, y1, x2, y2 = roi
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            # Reject if touches x1 <= 5, y1 <= 5, x2 >= W - 5, or y2 >= H - 5
+            if x1 <= 5.0 or y1 <= 5.0 or x2 >= (w - 5.0) or y2 >= (h - 5.0):
+                continue
+
+            # Reject if center lies within 6% of the frame edge
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            if cx < 0.06 * w or cx > 0.94 * w or cy < 0.06 * h or cy > 0.94 * h:
+                continue
+
+            filtered_rois.append([x1, y1, x2, y2])
+
+        filtered_rois.sort(key=lambda r: (r[2] - r[0]) * (r[3] - r[1]), reverse=True)
+        return filtered_rois
 
     def clip_features(
         self,
         F: torch.Tensor,
         image: Optional[Union[np.ndarray, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """Apply spatial feature norm clipping to feature map F of shape (B, C, H, W)."""
+        """Apply border-safe spatial feature norm clipping to feature map F of shape (B, C, H, W)."""
         if image is not None:
             self.set_image(image)
 
@@ -261,16 +300,39 @@ class SpatialFeatureNormClipper:
 
         # 1. Channel-wise L2 norm at each spatial grid cell: E_{i,j} = ||F_{:, i, j}||_2
         E = torch.linalg.vector_norm(F, ord=2, dim=1)  # shape (B, H, W)
+        B, H, W = E.shape
 
-        # 2. Spatial mean (\mu_E) and standard deviation (\sigma_E) across H x W grid
-        mu_E = torch.mean(E, dim=(-2, -1), keepdim=True)  # shape (B, 1, 1)
-        sigma_E = torch.std(E, dim=(-2, -1), keepdim=True)  # shape (B, 1, 1)
+        # CRITICAL BORDER FIX: Zero out the outer 1-grid-cell border of E_{i,j} (or outer 6% margin)
+        # BEFORE computing spatial mean (\mu_E) and std (\sigma_E) so Conv2d zero-padding spikes
+        # at the camera edges are ignored.
+        margin_h = max(1, int(self.border_margin * H)) if H >= 3 else 0
+        margin_h = min(margin_h, (H - 1) // 2) if H >= 3 else 0
+        margin_w = max(1, int(self.border_margin * W)) if W >= 3 else 0
+        margin_w = min(margin_w, (W - 1) // 2) if W >= 3 else 0
+
+        interior_mask = torch.zeros((H, W), dtype=torch.bool, device=F.device)
+        if H > 2 * margin_h and W > 2 * margin_w:
+            interior_mask[margin_h : H - margin_h, margin_w : W - margin_w] = True
+
+        # Zero out outer border
+        E_masked = E.clone()
+        if not interior_mask.all():
+            E_masked[:, ~interior_mask] = 0.0
+
+        # 2. Spatial mean (\mu_E) and standard deviation (\sigma_E) across valid interior grid
+        if interior_mask.any():
+            E_interior = E_masked[:, interior_mask]  # shape (B, num_interior)
+            mu_E = torch.mean(E_interior, dim=-1, keepdim=True).unsqueeze(-1)  # shape (B, 1, 1)
+            sigma_E = torch.std(E_interior, dim=-1, keepdim=True).unsqueeze(-1)  # shape (B, 1, 1)
+        else:
+            mu_E = torch.mean(E_masked, dim=(-2, -1), keepdim=True)
+            sigma_E = torch.std(E_masked, dim=(-2, -1), keepdim=True)
 
         # 3. Threshold \tau = \mu_E + alpha * \sigma_E
         tau = mu_E + self.alpha * sigma_E  # shape (B, 1, 1)
 
         # Cache metrics
-        E_det = E.detach()
+        E_det = E_masked.detach()
         mu_det = mu_E.detach()
         sigma_det = sigma_E.detach()
         tau_det = tau.detach()
@@ -284,7 +346,8 @@ class SpatialFeatureNormClipper:
 
         # 4. Clamp outlier activation spikes where E_{i,j} > \tau by scaling feature vector:
         # F'_{:, i, j} = F_{:, i, j} * min(1.0, \tau / (E_{i,j} + 1e-6))
-        scale = torch.clamp(tau / (E + 1e-6), max=1.0)  # shape (B, H, W)
+        # Note: border cells have E_masked = 0 <= tau, so scale is 1.0 (border spikes are ignored).
+        scale = torch.clamp(tau / (E_masked + 1e-6), max=1.0)  # shape (B, H, W)
         F_clipped = F * scale.unsqueeze(1)  # shape (B, C, H, W)
 
         # 5. Store pre-clipped spatial anomaly heatmap (where E_{i,j} > \tau)
@@ -309,6 +372,18 @@ class SpatialFeatureNormClipper:
         # Upsample spatial anomaly heatmap to image coordinates
         a_up = cv2.resize(self.spatial_anomaly_heatmap, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
         merged = a_up * (0.5 + 0.5 * jpeg_diff)
+
+        # Mask out the outer 6% border of the frame before thresholding contours
+        top_m = int(0.06 * img_h)
+        bot_m = int(0.94 * img_h)
+        left_m = int(0.06 * img_w)
+        right_m = int(0.94 * img_w)
+
+        merged[0:top_m, :] = 0.0
+        merged[bot_m:img_h, :] = 0.0
+        merged[:, 0:left_m] = 0.0
+        merged[:, right_m:img_w] = 0.0
+
         m_max = float(np.max(merged))
         if m_max > 0:
             self.merged_heatmap = (merged / m_max).astype(np.float32)
@@ -316,7 +391,7 @@ class SpatialFeatureNormClipper:
             self.merged_heatmap = np.zeros_like(merged, dtype=np.float32)
 
         # 7. Output candidate patch_rois (list of [x1, y1, x2, y2] bounding boxes in image coordinates)
-        if a_max > 0:
+        if m_max > 0:
             self.patch_rois = self._extract_candidate_rois(self.merged_heatmap)
         else:
             self.patch_rois = []

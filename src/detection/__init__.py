@@ -5,6 +5,8 @@ from src.detection.detector import (
     UltralyticsPyTorchWrapper,
     YOLOv8ONNXDetector,
     YOLOv8PyTorchDetector,
+    is_inside_torso,
+    is_near_frame_edge,
     neutralize_patch_regions,
 )
 from src.detection.feature_extractor import (
@@ -19,6 +21,8 @@ __all__ = [
     "YOLOv8ONNXDetector",
     "YOLOv8PyTorchDetector",
     "UltralyticsPyTorchWrapper",
+    "is_near_frame_edge",
+    "is_inside_torso",
     "neutralize_patch_regions",
     "ByteTracker",
     "Track",

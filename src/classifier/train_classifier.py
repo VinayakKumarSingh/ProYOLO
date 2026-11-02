@@ -33,6 +33,7 @@ if WORKSPACE_ROOT not in sys.path:
 import cv2
 import joblib
 import numpy as np
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.metrics import f1_score, precision_score, recall_score
 from sklearn.model_selection import StratifiedKFold
@@ -145,9 +146,55 @@ class HardNegativePatchApplier:
             y += 24
         return img
 
+    def generate_color_blocks(self, width: int = 120, height: int = 120) -> np.ndarray:
+        """Generate high-contrast geometric color block pattern."""
+        img = np.zeros((height, width, 3), dtype=np.uint8)
+        num_blocks = self.rng.choice([2, 3, 4])
+        split_horiz = self.rng.choice([True, False])
+        colors = [
+            (220, 40, 40), (40, 200, 40), (40, 40, 220),
+            (240, 240, 30), (240, 120, 20), (20, 20, 20), (240, 240, 240)
+        ]
+        chosen = [colors[i] for i in self.rng.choice(len(colors), size=num_blocks, replace=False)]
+        if split_horiz:
+            h_step = height // num_blocks
+            for i, col in enumerate(chosen):
+                y1 = i * h_step
+                y2 = height if i == num_blocks - 1 else (i + 1) * h_step
+                img[y1:y2, :] = col
+        else:
+            w_step = width // num_blocks
+            for i, col in enumerate(chosen):
+                x1 = i * w_step
+                x2 = width if i == num_blocks - 1 else (i + 1) * w_step
+                img[:, x1:x2] = col
+        return img
+
+    def generate_smooth_tv_patch(self, width: int = 120, height: int = 120) -> np.ndarray:
+        """Generate smooth Total-Variation (Thys et al. L_tv) colorful blob patch."""
+        low_h = max(4, height // 6)
+        low_w = max(4, width // 6)
+        low = self.rng.randint(0, 256, (low_h, low_w, 3), dtype=np.uint8)
+        pat = cv2.resize(low, (width, height), interpolation=cv2.INTER_CUBIC)
+        ksize = 2 * (max(width, height) // 10) + 1
+        pat = cv2.GaussianBlur(pat, (ksize, ksize), sigmaX=2.5)
+        # Enhance color saturation
+        hsv = cv2.cvtColor(pat, cv2.COLOR_BGR2HSV).astype(np.float32)
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.5, 0, 255)
+        hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 1.2, 50, 255)
+        return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+    def generate_dpatch_grid(self, width: int = 120, height: int = 120) -> np.ndarray:
+        """Generate high-frequency DPATCH grid pattern."""
+        cell = max(2, min(width, height) // 6)
+        rows = height // cell + 1
+        cols = width // cell + 1
+        raw = self.rng.randint(0, 256, (rows, cols, 3), dtype=np.uint8)
+        return cv2.resize(raw, (width, height), interpolation=cv2.INTER_NEAREST)
+
     def generate_random_benign_patch(self, width: int = 120, height: int = 120) -> np.ndarray:
         """Sample a random high-contrast benign patch pattern."""
-        choice = self.rng.choice(["checkerboard", "stripes_v", "stripes_d", "qr", "text"])
+        choice = self.rng.choice(["checkerboard", "stripes_v", "stripes_d", "qr", "text", "color_blocks"])
         if choice == "checkerboard":
             return self.generate_checkerboard(width, height)
         elif choice == "stripes_v":
@@ -156,8 +203,16 @@ class HardNegativePatchApplier:
             return self.generate_stripes(width, height, orientation="diagonal")
         elif choice == "qr":
             return self.generate_qr_like(width, height)
+        elif choice == "color_blocks":
+            return self.generate_color_blocks(width, height)
         else:
             return self.generate_text_box(width, height)
+
+    def generate_random_adversarial_patch(self, width: int = 120, height: int = 120) -> np.ndarray:
+        """Sample a random adversarial patch pattern (smooth TV blob or DPATCH grid)."""
+        if self.rng.rand() < 0.5:
+            return self.generate_smooth_tv_patch(width, height)
+        return self.generate_dpatch_grid(width, height)
 
     def apply_eot_transform(
         self,
@@ -191,12 +246,14 @@ class HardNegativePatchApplier:
         self,
         image: np.ndarray,
         bbox: Sequence[float],
+        patch_type: str = "benign",
     ) -> Tuple[np.ndarray, List[float]]:
-        """Apply a transformed hard-negative benign patch onto the person bounding box.
+        """Apply a transformed patch (benign or adversarial) onto the person bounding box.
 
         Args:
             image: Input BGR image (H, W, 3).
             bbox: Person bounding box [x1, y1, x2, y2].
+            patch_type: 'benign' or 'adversarial'.
 
         Returns:
             Tuple of (augmented_image, patch_roi [px1, py1, px2, py2]).
@@ -219,8 +276,11 @@ class HardNegativePatchApplier:
         actual_w = max(4, px2 - px1)
         actual_h = max(4, py2 - py1)
 
-        # Generate benign pattern and apply EOT
-        raw_patch = self.generate_random_benign_patch(actual_w, actual_h)
+        # Generate pattern and apply EOT
+        if patch_type == "adversarial":
+            raw_patch = self.generate_random_adversarial_patch(actual_w, actual_h)
+        else:
+            raw_patch = self.generate_random_benign_patch(actual_w, actual_h)
         transformed_patch = self.apply_eot_transform(raw_patch, actual_w, actual_h)
 
         # Overlay onto image
@@ -238,6 +298,179 @@ class HardNegativePatchApplier:
             augmented[py1_c:py2_c, px1_c:px2_c] = patch_cropped
 
         return augmented, [float(px1_c), float(py1_c), float(px2_c), float(py2_c)]
+
+
+def generate_realistic_dataset(
+    n_samples_per_split: int = 200,
+    seed: int = 42,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build a self-contained training pipeline that generates 600 realistic image samples across 3 balanced splits:
+
+    1. Clean person/background crops (label = 0): Natural silhouettes and solid clothing where delta_p_obj ~ 0.0.
+    2. Hard-Negative Benign Clothing crops (label = 0): High-contrast checkerboards, stripes, text logos,
+       and color blocks warped with EOT transforms (rotation +-20 deg, scale, brightness jitter) where delta_p_obj ~ 0.0.
+    3. Adversarial Patch crops (label = 1): Smooth Total-Variation (Thys et al. L_tv) colorful blob patches
+       and high-frequency DPATCH grids paired with simulated objectness suppression (delta_p_obj >= 0.15).
+
+    Extracts real feature vectors via DualFeatureExtractor and returns (X, y) with 15-dimensional features.
+    """
+    rng = np.random.RandomState(seed)
+    applier = HardNegativePatchApplier(seed=seed)
+    extractor = DualFeatureExtractor()
+
+    def make_base_image() -> Tuple[np.ndarray, List[float]]:
+        h, w = 240, 160
+        img = np.zeros((h, w, 3), dtype=np.uint8)
+        base_col = rng.randint(90, 180, 3)
+        img[:] = base_col
+        # Realistic texture & sensor noise
+        noise = rng.randint(-12, 13, img.shape, dtype=np.int16)
+        img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+        # Person bounding box: roughly central silhouette
+        bx1, by1, bx2, by2 = 30.0, 20.0, 130.0, 220.0
+        bw = bx2 - bx1
+        bh = by2 - by1
+
+        # Torso clothing base
+        torso_col = rng.randint(20, 120, 3).tolist()
+        ty1, ty2 = int(by1 + 0.15 * bh), int(by1 + 0.65 * bh)
+        tx1, tx2 = int(bx1 + 0.15 * bw), int(bx2 - 0.15 * bw)
+        img[ty1:ty2, tx1:tx2] = torso_col
+
+        # Legs/pants
+        pants_col = rng.randint(15, 80, 3).tolist()
+        img[ty2:int(by2), int(bx1 + 0.20 * bw):int(bx2 - 0.20 * bw)] = pants_col
+        return img, [bx1, by1, bx2, by2]
+
+    X_list: List[np.ndarray] = []
+    y_list: List[int] = []
+
+    # ------------------------------------------------------------------------
+    # Split 1: Clean person/background crops (label = 0)
+    # ------------------------------------------------------------------------
+    for _ in range(n_samples_per_split):
+        img, pbox = make_base_image()
+        roi = extractor.crop_upper_body(img, np.array(pbox))
+        vis_feats = extractor.compute_visual_features(roi)
+        gn = extractor.compute_grid_norm_ratio(roi)
+        jd = extractor.compute_jpeg_recompression_delta(img, candidate_roi=pbox)
+
+        temp_feats = {
+            "conf_current": float(rng.uniform(0.85, 0.98)),
+            "conf_drop": float(rng.uniform(0.00, 0.04)),
+            "conf_std": float(rng.uniform(0.01, 0.04)),
+            "area_stability": float(rng.uniform(0.01, 0.06)),
+            "aspect_ratio_stability": float(rng.uniform(0.01, 0.05)),
+            "mean_consecutive_iou": float(rng.uniform(0.88, 0.98)),
+            "min_consecutive_iou": float(rng.uniform(0.80, 0.95)),
+            "flicker_rate": 0.0,
+        }
+        dpatch_feats = {
+            "max_grid_norm_ratio": float(gn),
+            "jpeg_recompression_delta": float(jd),
+        }
+        fused = {**temp_feats, **vis_feats, **dpatch_feats}
+        vec = np.array([fused.get(name, 0.0) for name in FEATURE_NAMES], dtype=np.float32)
+        X_list.append(np.nan_to_num(vec, nan=0.0, posinf=1.0, neginf=0.0))
+        y_list.append(0)
+
+    # ------------------------------------------------------------------------
+    # Split 2: Hard-Negative Benign Clothing crops (label = 0)
+    # ------------------------------------------------------------------------
+    for _ in range(n_samples_per_split):
+        img, pbox = make_base_image()
+        bw = int(pbox[2] - pbox[0])
+        bh = int(pbox[3] - pbox[1])
+
+        # Benign high-contrast pattern
+        pw = max(16, int(bw * rng.uniform(0.20, 0.40)))
+        ph = max(16, int(bh * rng.uniform(0.18, 0.35)))
+        raw_patch = applier.generate_random_benign_patch(pw, ph)
+        warped_patch = applier.apply_eot_transform(raw_patch, pw, ph)
+
+        px1 = int(pbox[0] + 0.25 * bw)
+        py1 = int(pbox[1] + 0.20 * bh)
+        px2 = min(img.shape[1], px1 + pw)
+        py2 = min(img.shape[0], py1 + ph)
+        img[py1:py2, px1:px2] = warped_patch[:py2 - py1, :px2 - px1]
+        patch_roi = [float(px1), float(py1), float(px2), float(py2)]
+
+        roi = extractor.crop_upper_body(img, np.array(pbox))
+        vis_feats = extractor.compute_visual_features(roi)
+        gn = extractor.compute_grid_norm_ratio(roi)
+        jd = extractor.compute_jpeg_recompression_delta(img, candidate_roi=patch_roi)
+
+        temp_feats = {
+            "conf_current": float(rng.uniform(0.84, 0.97)),
+            "conf_drop": float(rng.uniform(0.00, 0.04)),  # unsuppressed, NO drop
+            "conf_std": float(rng.uniform(0.01, 0.05)),
+            "area_stability": float(rng.uniform(0.01, 0.07)),
+            "aspect_ratio_stability": float(rng.uniform(0.01, 0.06)),
+            "mean_consecutive_iou": float(rng.uniform(0.86, 0.97)),
+            "min_consecutive_iou": float(rng.uniform(0.78, 0.95)),
+            "flicker_rate": 0.0,
+        }
+        dpatch_feats = {
+            "max_grid_norm_ratio": float(gn),
+            "jpeg_recompression_delta": float(jd),
+        }
+        fused = {**temp_feats, **vis_feats, **dpatch_feats}
+        vec = np.array([fused.get(name, 0.0) for name in FEATURE_NAMES], dtype=np.float32)
+        X_list.append(np.nan_to_num(vec, nan=0.0, posinf=1.0, neginf=0.0))
+        y_list.append(0)
+
+    # ------------------------------------------------------------------------
+    # Split 3: Adversarial Patch crops (label = 1)
+    # ------------------------------------------------------------------------
+    for i in range(n_samples_per_split):
+        img, pbox = make_base_image()
+        bw = int(pbox[2] - pbox[0])
+        bh = int(pbox[3] - pbox[1])
+
+        pw = max(16, int(bw * rng.uniform(0.20, 0.40)))
+        ph = max(16, int(bh * rng.uniform(0.18, 0.35)))
+
+        # 50% Smooth TV colorful blob (Thys et al. L_tv), 50% high-frequency DPATCH grid
+        is_tv = (i < (n_samples_per_split // 2))
+        raw_patch = applier.generate_smooth_tv_patch(pw, ph) if is_tv else applier.generate_dpatch_grid(pw, ph)
+        warped_patch = applier.apply_eot_transform(raw_patch, pw, ph)
+
+        px1 = int(pbox[0] + 0.25 * bw)
+        py1 = int(pbox[1] + 0.20 * bh)
+        px2 = min(img.shape[1], px1 + pw)
+        py2 = min(img.shape[0], py1 + ph)
+        img[py1:py2, px1:px2] = warped_patch[:py2 - py1, :px2 - px1]
+        patch_roi = [float(px1), float(py1), float(px2), float(py2)]
+
+        roi = extractor.crop_upper_body(img, np.array(pbox))
+        vis_feats = extractor.compute_visual_features(roi)
+        gn = extractor.compute_grid_norm_ratio(roi)
+        jd = extractor.compute_jpeg_recompression_delta(img, candidate_roi=patch_roi)
+
+        temp_feats = {
+            "conf_current": float(rng.uniform(0.16, 0.48)),  # severely suppressed
+            "conf_drop": float(rng.uniform(0.35, 0.85)),     # large confidence drop
+            "conf_std": float(rng.uniform(0.16, 0.48)),
+            "area_stability": float(rng.uniform(0.22, 0.65)),
+            "aspect_ratio_stability": float(rng.uniform(0.18, 0.50)),
+            "mean_consecutive_iou": float(rng.uniform(0.30, 0.65)),
+            "min_consecutive_iou": float(rng.uniform(0.10, 0.45)),
+            "flicker_rate": float(rng.uniform(0.12, 0.55)),
+        }
+        dpatch_feats = {
+            "max_grid_norm_ratio": float(gn),
+            "jpeg_recompression_delta": float(jd),
+        }
+        fused = {**temp_feats, **vis_feats, **dpatch_feats}
+        vec = np.array([fused.get(name, 0.0) for name in FEATURE_NAMES], dtype=np.float32)
+        X_list.append(np.nan_to_num(vec, nan=0.0, posinf=1.0, neginf=0.0))
+        y_list.append(1)
+
+    X = np.array(X_list, dtype=np.float32)
+    y = np.array(y_list, dtype=np.int32)
+    perm = rng.permutation(len(y))
+    return X[perm], y[perm]
 
 
 def generate_synthetic_features(
@@ -362,109 +595,30 @@ def load_or_extract_dataset(
     data_dir: Union[str, Path] = "data",
     cache_file: str = "extracted_features.npz",
     use_synthetic_fallback: bool = True,
+    n_samples_per_split: int = 200,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Ingest feature vectors from disk dataset, caching results for fast retraining."""
     data_path = Path(data_dir)
     cache_path = data_path / cache_file
 
-    # 1. Return cached features if available
+    # 1. Return cached features if available and matches 15-D features and >= 600 samples
     if cache_path.exists():
-        logger.info("Loading cached feature vectors from: %s", cache_path)
-        cached = np.load(str(cache_path))
-        return cached["X"], cached["y"]
+        try:
+            cached = np.load(str(cache_path))
+            cX, cy = cached["X"], cached["y"]
+            if cX.ndim == 2 and cX.shape[1] == len(FEATURE_NAMES) and len(cX) >= 600:
+                logger.info("Loading valid cached 15-D feature vectors (%d samples) from: %s", len(cy), cache_path)
+                return cX, cy
+        except Exception:
+            pass
 
-    annotations_file = data_path / "annotations.json"
-    if not annotations_file.exists():
-        if use_synthetic_fallback:
-            logger.warning(
-                "Dataset %s not found. Using high-fidelity synthetic feature synthesis.",
-                annotations_file,
-            )
-            return generate_synthetic_features(n_samples_per_class=1000)
-        raise FileNotFoundError(f"Annotations file not found: {annotations_file}")
-
-    # 2. Extract features from annotations and images
-    logger.info("Extracting feature vectors from raw images in %s...", data_dir)
-    with open(annotations_file, "r", encoding="utf-8") as f:
-        meta = json.load(f)
-    records = meta.get("data", [])
-
-    extractor = DualFeatureExtractor()
-    patch_applier = HardNegativePatchApplier(seed=42)
-    X_list: List[np.ndarray] = []
-    y_list: List[int] = []
-
-    for item in records:
-        rel_path = item.get("filename", "")
-        img_file = data_path / rel_path
-        if not img_file.exists():
-            continue
-
-        img = cv2.imread(str(img_file))
-        if img is None:
-            continue
-
-        label = int(item.get("label", 0))
-        pbox = np.array(item.get("person_bbox", [100, 100, 200, 300]), dtype=np.float32)
-
-        # Apply hard-negative benign patch augmentation to 30% of negative class samples
-        is_hard_negative = (label == 0 and np.random.rand() < 0.30)
-        if is_hard_negative:
-            aug_img, _ = patch_applier.apply(img, pbox)
-            roi = extractor.crop_upper_body(aug_img, pbox)
-        else:
-            roi = extractor.crop_upper_body(img, pbox)
-
-        # Visual features from image ROI
-        vis_feats = extractor.compute_visual_features(roi)
-
-        # Temporal features from metadata record
-        conf_base = float(item.get("confidence_baseline", 0.90))
-        conf_pert = float(item.get("confidence_perturbed", 0.90))
-        conf_delta = float(item.get("confidence_delta", 0.0))
-
-        if label == 0:
-            # Clean frame
-            temp_feats = {
-                "conf_current": conf_base,
-                "conf_drop": 0.0,
-                "conf_std": 0.02,
-                "area_stability": 0.03,
-                "aspect_ratio_stability": 0.02,
-                "mean_consecutive_iou": 0.94,
-                "min_consecutive_iou": 0.88,
-                "flicker_rate": 0.0,
-            }
-        else:
-            # Perturbed frame
-            temp_feats = {
-                "conf_current": conf_pert,
-                "conf_drop": conf_delta,
-                "conf_std": min(1.0, conf_delta * 0.6),
-                "area_stability": 0.35,
-                "aspect_ratio_stability": 0.25,
-                "mean_consecutive_iou": 0.55,
-                "min_consecutive_iou": 0.35,
-                "flicker_rate": 0.20,
-            }
-
-        fused = {}
-        fused.update(temp_feats)
-        fused.update(vis_feats)
-
-        vec = np.array([fused.get(name, 0.0) for name in FEATURE_NAMES], dtype=np.float32)
-        X_list.append(np.nan_to_num(vec, nan=0.0, posinf=1.0, neginf=0.0))
-        y_list.append(label)
-
-    if not X_list:
-        logger.warning("No valid images found in %s; falling back to synthetic generator.", data_dir)
-        return generate_synthetic_features(n_samples_per_class=1000)
-
-    X = np.array(X_list, dtype=np.float32)
-    y = np.array(y_list, dtype=np.int32)
+    # 2. Generate 600 realistic image samples across 3 balanced splits
+    logger.info("Generating 600 realistic image samples across 3 balanced splits...")
+    X, y = generate_realistic_dataset(n_samples_per_split=n_samples_per_split, seed=42)
 
     # Save to cache
     try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(str(cache_path), X=X, y=y)
         logger.info("Cached %d feature vectors to %s", len(y), cache_path)
     except Exception as exc:
@@ -508,30 +662,50 @@ def train_and_benchmark_models(
     """Train and evaluate candidate models using 5-fold cross-validation.
 
     Evaluates:
-    1. RandomForestClassifier (n_estimators=50, max_depth=8)
-    2. HistGradientBoostingClassifier (max_iter=50, max_depth=8)
-    3. XGBClassifier (n_estimators=50, max_depth=6)
+    1. CalibratedRandomForest (RandomForest with CalibratedClassifierCV)
+    2. RandomForest (RandomForestClassifier, n_estimators=30, max_depth=6)
+    3. CalibratedHistGradient (HistGradientBoosting with CalibratedClassifierCV)
+    4. HistGradientBoosting (HistGradientBoostingClassifier, max_iter=40, max_depth=6)
 
     Returns:
         Dictionary summarizing metrics and the best model result.
     """
     candidate_models: Dict[str, Any] = {
+        "CalibratedRandomForest": CalibratedClassifierCV(
+            estimator=RandomForestClassifier(
+                n_estimators=15,
+                max_depth=6,
+                random_state=random_state,
+                n_jobs=1,
+            ),
+            method="sigmoid",
+            cv=2,
+        ),
         "RandomForest": RandomForestClassifier(
-            n_estimators=50,
-            max_depth=8,
+            n_estimators=25,
+            max_depth=6,
             random_state=random_state,
             n_jobs=1,
         ),
+        "CalibratedHistGradient": CalibratedClassifierCV(
+            estimator=HistGradientBoostingClassifier(
+                max_iter=30,
+                max_depth=6,
+                random_state=random_state,
+            ),
+            method="sigmoid",
+            cv=2,
+        ),
         "HistGradientBoosting": HistGradientBoostingClassifier(
-            max_iter=50,
-            max_depth=8,
+            max_iter=40,
+            max_depth=6,
             random_state=random_state,
         ),
     }
 
     if XGBClassifier is not None:
         candidate_models["XGBoost"] = XGBClassifier(
-            n_estimators=50,
+            n_estimators=30,
             max_depth=6,
             learning_rate=0.1,
             random_state=random_state,
@@ -539,11 +713,11 @@ def train_and_benchmark_models(
             n_jobs=1,
         )
 
-    logger.info("Starting 5-fold Stratified Cross-Validation across %d models...", len(candidate_models))
+    logger.info("Starting %d-fold Stratified Cross-Validation across %d models...", n_splits, len(candidate_models))
     cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     benchmarks: List[ModelBenchmarkResult] = []
 
-    test_single_sample = X[:1]  # Shape [1, 13]
+    test_single_sample = X[:1]  # Shape [1, 15]
 
     for name, model in candidate_models.items():
         precisions: List[float] = []
@@ -584,13 +758,33 @@ def train_and_benchmark_models(
             res.cpu_latency_per_sample_ms,
         )
 
-    # 3. Select best model based on F1-score and low latency
-    best_result = max(benchmarks, key=lambda b: (b.mean_f1, -b.cpu_latency_per_sample_ms))
-    logger.info("Best model selected: %s (F1: %.4f)", best_result.model_name, best_result.mean_f1)
+    # 3. Select best model prioritizing calibrated pipeline and sub-2ms latency
+    rf_cal_candidates = [b for b in benchmarks if "CalibratedRandomForest" in b.model_name and b.cpu_latency_per_sample_ms < 2.0]
+    if rf_cal_candidates:
+        best_result = max(rf_cal_candidates, key=lambda b: (b.mean_f1, -b.cpu_latency_per_sample_ms))
+    else:
+        calibrated_candidates = [b for b in benchmarks if "Calibrated" in b.model_name and b.cpu_latency_per_sample_ms < 2.0]
+        if calibrated_candidates:
+            best_result = max(calibrated_candidates, key=lambda b: (b.mean_f1, -b.cpu_latency_per_sample_ms))
+        else:
+            low_lat_candidates = [b for b in benchmarks if b.cpu_latency_per_sample_ms < 2.0]
+            pool = low_lat_candidates if low_lat_candidates else benchmarks
+            best_result = max(pool, key=lambda b: (b.mean_f1, -b.cpu_latency_per_sample_ms))
+    logger.info("Best model selected: %s (F1: %.4f, Latency: %.3f ms)", best_result.model_name, best_result.mean_f1, best_result.cpu_latency_per_sample_ms)
 
     # 4. Refit winning model on full dataset
     final_model = best_result.trained_model
     final_model.fit(X, y)
+
+    # Attach feature importances for explainability attribution if calibrated
+    if hasattr(final_model, "calibrated_classifiers_"):
+        imps = [
+            getattr(c, "estimator", c).feature_importances_
+            for c in final_model.calibrated_classifiers_
+            if hasattr(getattr(c, "estimator", c), "feature_importances_")
+        ]
+        if imps:
+            final_model.feature_importances_ = np.mean(imps, axis=0)
 
     # 5. Save joblib artifact
     out_joblib = Path(output_model_path)
@@ -622,7 +816,7 @@ def train_and_benchmark_models(
     }
 
 
-def export_classifier_to_onnx(model: Any, output_path: str, num_features: int = 13) -> Optional[str]:
+def export_classifier_to_onnx(model: Any, output_path: str, num_features: int = 15) -> Optional[str]:
     """Export Scikit-Learn or XGBoost model to ONNX format."""
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -646,7 +840,7 @@ def export_classifier_to_onnx(model: Any, output_path: str, num_features: int = 
     if convert_sklearn is not None:
         try:
             initial_type = [("float_input", FloatTensorType([None, num_features]))]
-            onx = convert_sklearn(model, initial_types=initial_type, target_opset=12)
+            onx = convert_sklearn(model, initial_types=initial_type, target_opset=17)
             with open(out_path, "wb") as f:
                 f.write(onx.SerializeToString())
             logger.info("Exported Scikit-Learn ONNX model via skl2onnx to: %s", out_path)
@@ -663,9 +857,13 @@ if __name__ == "__main__":
     parser.add_argument("--splits", type=int, default=5, help="Number of cross-validation folds")
     parser.add_argument("--joblib_out", type=str, default="models/attack_classifier.joblib")
     parser.add_argument("--onnx_out", type=str, default="models/attack_classifier.onnx")
+    parser.add_argument("--samples_per_split", type=int, default=200, help="Samples per split (default: 200, total: 600)")
     args = parser.parse_args()
 
-    features_X, labels_y = load_or_extract_dataset(data_dir=args.data_dir)
+    features_X, labels_y = load_or_extract_dataset(
+        data_dir=args.data_dir,
+        n_samples_per_split=args.samples_per_split,
+    )
     results = train_and_benchmark_models(
         X=features_X,
         y=labels_y,

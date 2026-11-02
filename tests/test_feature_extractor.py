@@ -18,6 +18,8 @@ import torch.nn as nn
 from src.detection.detector import (
     Detection,
     YOLOv8ONNXDetector,
+    is_inside_torso,
+    is_near_frame_edge,
     neutralize_patch_regions,
 )
 from src.detection.feature_extractor import (
@@ -228,6 +230,194 @@ class TestYOLOv8ONNXDetector:
         assert recovered.delta_p_obj == pytest.approx(0.82 - 0.0, abs=1e-3)
         assert recovered.recovered_by_inpainting is True
 
+    def test_is_near_frame_edge_guard(self):
+        """is_near_frame_edge returns True if box touches or is within 5% frame margin."""
+        frame_shape = (480, 640)
+        # Margin = 0.05 * 640 = 32px horizontally, 0.05 * 480 = 24px vertically
+
+        # Left edge touch (x1 <= 32)
+        assert is_near_frame_edge([10, 100, 100, 200], frame_shape, margin=0.05) is True
+        # Top edge touch (y1 <= 24)
+        assert is_near_frame_edge([100, 15, 200, 200], frame_shape, margin=0.05) is True
+        # Right edge touch (x2 >= 640 - 32 = 608)
+        assert is_near_frame_edge([500, 100, 615, 200], frame_shape, margin=0.05) is True
+        # Bottom edge touch (y2 >= 480 - 24 = 456)
+        assert is_near_frame_edge([100, 300, 200, 465], frame_shape, margin=0.05) is True
+        # Interior box (well away from all edges)
+        assert is_near_frame_edge([100, 100, 250, 300], frame_shape, margin=0.05) is False
+
+    def test_is_inside_torso_guard(self):
+        """is_inside_torso returns True only if patch center is in torso and area ratio is 4%..45%."""
+        # Person box: width = 100, height = 200, area = 20000
+        person_box = [100.0, 100.0, 200.0, 300.0]
+        # Torso center bounds: x in [115, 185], y in [130, 260]
+
+        # Valid chest/torso patch: [130, 160, 170, 220] -> cx=150, cy=190, area=2400 (12%)
+        valid_patch = [130.0, 160.0, 170.0, 220.0]
+        assert is_inside_torso(valid_patch, person_box) is True
+
+        # Patch too high (head/face region): cy = 115 < 130
+        head_patch = [135.0, 105.0, 165.0, 125.0]
+        assert is_inside_torso(head_patch, person_box) is False
+
+        # Patch too low (feet/legs region): cy = 285 > 260
+        feet_patch = [135.0, 275.0, 165.0, 295.0]
+        assert is_inside_torso(feet_patch, person_box) is False
+
+        # Patch too small (< 4% person area): area = 10 * 10 = 100 (0.5%)
+        tiny_patch = [145.0, 185.0, 155.0, 195.0]
+        assert is_inside_torso(tiny_patch, person_box) is False
+
+        # Patch too large (> 45% person area): area = 80 * 150 = 12000 (60%)
+        huge_patch = [110.0, 120.0, 190.0, 270.0]
+        assert is_inside_torso(huge_patch, person_box) is False
+
+    def test_detect_with_recovery_preserves_80_coco_classes(self):
+        """detect_with_recovery retains non-person COCO classes untouched with is_attack=False."""
+        detector = YOLOv8ONNXDetector(session="mock_session")
+
+        p_det = Detection(bbox=np.array([100.0, 100.0, 200.0, 300.0]), confidence=0.88, class_id=0, class_name="person")
+        laptop_det = Detection(bbox=np.array([250.0, 200.0, 350.0, 300.0]), confidence=0.78, class_id=63, class_name="laptop")
+        phone_det = Detection(bbox=np.array([180.0, 150.0, 210.0, 190.0]), confidence=0.82, class_id=67, class_name="cell phone")
+
+        detector.detect = lambda frame, conf_threshold=None: [p_det, laptop_det, phone_det]
+
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        results = detector.detect_with_recovery(frame, conf_thresh=0.40, low_conf_thresh=0.15)
+
+        assert len(results) == 3
+        class_names = [d.class_name for d in results]
+        assert "person" in class_names
+        assert "laptop" in class_names
+        assert "cell phone" in class_names
+
+        for d in results:
+            if d.class_name != "person":
+                assert d.is_attack is False
+                assert d.delta_p_obj == 0.0
+                assert d.recovered_by_inpainting is False
+                # Verify dict interface
+                d_dict = d.to_dict()
+                assert d_dict["is_attack"] is False
+                assert d["is_attack"] is False
+                assert d["class_name"] == d.class_name
+
+    def test_detect_with_recovery_edge_guard_rejects_border_patch(self):
+        """Patch ROIs near frame edges must be filtered out and never trigger Pass 2."""
+        detector = YOLOv8ONNXDetector(session="mock_session")
+        p_det = Detection(bbox=np.array([200.0, 150.0, 350.0, 400.0]), confidence=0.85, class_id=0, class_name="person")
+
+        call_count = 0
+
+        def mock_detect(frame, conf_threshold=None):
+            nonlocal call_count
+            call_count += 1
+            return [p_det]
+
+        detector.detect = mock_detect
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        # Border patch at x1=5 (touches margin 5%)
+        border_patch = [5.0, 50.0, 40.0, 100.0]
+        results = detector.detect_with_recovery(
+            frame,
+            conf_thresh=0.40,
+            low_conf_thresh=0.15,
+            patch_rois=[border_patch],
+        )
+
+        # Edge guard must filter out border patch; Pass 2 should NOT trigger
+        assert call_count == 1
+        assert len(results) == 1
+        assert results[0].class_name == "person"
+        assert results[0].recovered_by_inpainting is False
+
+    def test_detect_with_recovery_torso_guard_triggers_pass2_and_attaches_metadata(self):
+        """Valid interior patch on torso triggers Pass 2, computes delta_p_obj, and attaches patch_roi."""
+        detector = YOLOv8ONNXDetector(session="mock_session")
+
+        p_suppressed = Detection(
+            bbox=np.array([100.0, 80.0, 250.0, 350.0]),
+            confidence=0.18,
+            class_id=0,
+            class_name="person",
+        )
+        chair_det = Detection(
+            bbox=np.array([400.0, 300.0, 500.0, 450.0]),
+            confidence=0.80,
+            class_id=56,
+            class_name="chair",
+        )
+        p_recovered = Detection(
+            bbox=np.array([100.0, 80.0, 250.0, 350.0]),
+            confidence=0.86,
+            class_id=0,
+            class_name="person",
+        )
+
+        call_count = 0
+
+        def mock_detect(frame, conf_threshold=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return [p_suppressed, chair_det]
+            else:
+                return [p_recovered]
+
+        detector.detect = mock_detect
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        # Interior patch inside person's torso region
+        torso_patch = [150.0, 140.0, 200.0, 200.0]
+        results = detector.detect_with_recovery(
+            frame,
+            conf_thresh=0.40,
+            low_conf_thresh=0.15,
+            patch_rois=[torso_patch],
+        )
+
+        assert call_count == 2, "Pass 2 should trigger for valid torso patch"
+        assert len(results) == 2
+
+        person_res = [d for d in results if d.class_name == "person"][0]
+        chair_res = [d for d in results if d.class_name == "chair"][0]
+
+        assert person_res.confidence == 0.86
+        assert person_res.recovered_by_inpainting is True
+        assert person_res.delta_p_obj == pytest.approx(0.86 - 0.18, abs=1e-3)
+        assert person_res.is_attack is True
+        assert person_res.patch_roi == torso_patch
+
+        # Dict access checks
+        assert person_res["delta_p_obj"] == person_res.delta_p_obj
+        assert person_res["patch_roi"] == torso_patch
+        assert person_res.to_dict()["recovered_by_inpainting"] is True
+
+        assert chair_res.confidence == 0.80
+        assert chair_res.class_name == "chair"
+        assert chair_res.is_attack is False
+        assert chair_res.delta_p_obj == 0.0
+
+    def test_optional_patch_model_detection(self):
+        """Detector queries secondary patch_model to predict tight adversarial_patch boxes."""
+        class MockBox:
+            xyxy = torch.tensor([[120.0, 130.0, 180.0, 190.0]])
+
+        class MockResult:
+            boxes = MockBox()
+
+        class MockPatchModel:
+            def predict(self, *args, **kwargs):
+                return [MockResult()]
+
+        detector = YOLOv8ONNXDetector(session="mock_session", patch_model=MockPatchModel())
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        rois = detector.predict_patch_rois(frame)
+
+        assert len(rois) == 1
+        assert rois[0] == [120.0, 130.0, 180.0, 190.0]
+
 
 # ============================================================================
 # 2. ByteTracker Tests
@@ -309,8 +499,8 @@ class TestByteTracker:
         # Check that smoothed box is close to the expected position
         assert np.all(np.abs(smoothed_box - box) < 10.0)
 
-    def test_temporal_alert_persistence_k3_of_n5(self):
-        """Track alert confirms only if is_attack == True in at least K=3 out of N=5 frames."""
+    def test_temporal_alert_persistence_k4_of_n5(self):
+        """Track alert confirms ONLY when person tracklet is NOT near frame edge and is_attack in >= 4/5 frames."""
         det = Detection(
             bbox=np.array([50.0, 50.0, 150.0, 250.0]),
             confidence=0.9,
@@ -323,49 +513,76 @@ class TestByteTracker:
         assert track.record_attack_prediction(True) is False
         assert track.confirmed_attack_alert is False
 
-        # Frame 2: 0 attack -> 1/2 -> False
-        assert track.record_attack_prediction(False) is False
-        assert track.confirmed_attack_alert is False
-
-        # Frame 3: 1 attack -> 2/3 -> False
+        # Frame 2: 1 attack -> 2/2 -> False
         assert track.record_attack_prediction(True) is False
         assert track.confirmed_attack_alert is False
 
-        # Frame 4: 1 attack -> 3/4 -> True (K=3 reached!)
+        # Frame 3: 1 attack -> 3/3 -> False
+        assert track.record_attack_prediction(True) is False
+        assert track.confirmed_attack_alert is False
+
+        # Frame 4: 1 attack -> 4/4 -> True (K=4 reached!)
         assert track.record_attack_prediction(True) is True
         assert track.confirmed_attack_alert is True
 
-        # Frame 5: 0 attack -> 3/5 -> True (still 3 of last 5)
+        # Frame 5: 0 attack -> 4/5 -> True (still 4 of last 5)
         assert track.record_attack_prediction(False) is True
         assert track.confirmed_attack_alert is True
 
-        # Frame 6: 0 attack -> 2/5 -> False (drops below 3 of last 5)
+        # Frame 6: 0 attack -> 3/5 -> False (drops below 4 of last 5)
         assert track.record_attack_prediction(False) is False
         assert track.confirmed_attack_alert is False
 
+        # Frame Edge Guard: Person touching border (x1=5 < 32px margin) must NEVER confirm attack alert
+        edge_det = Detection(
+            bbox=np.array([5.0, 50.0, 120.0, 250.0]),
+            confidence=0.9,
+            class_id=0,
+            class_name="person",
+        )
+        edge_track = Track(detection=edge_det, frame_idx=0)
+        for _ in range(5):
+            edge_track.record_attack_prediction(True)
+        assert edge_track.confirmed_attack_alert is False
+
+        # Non-Person Guard: Non-person object (e.g. car, chair) must NEVER confirm attack alert
+        car_det = Detection(
+            bbox=np.array([100.0, 100.0, 200.0, 200.0]),
+            confidence=0.9,
+            class_id=2,
+            class_name="car",
+        )
+        car_track = Track(detection=car_det, frame_idx=0)
+        for _ in range(5):
+            car_track.record_attack_prediction(True)
+        assert car_track.confirmed_attack_alert is False
+
     def test_dpatch_global_persistence_deque(self):
-        """Tracker records global DPATCH candidate alerts requiring K=3 of N=5 consecutive frames."""
+        """Tracker records global DPATCH candidate alerts requiring K=4 of N=5 consecutive frames."""
         tracker = ByteTracker()
         assert tracker.confirmed_attack_alert is False
 
-        # Frame 1: Attack detected
+        # Frame 1: Attack detected (1/1)
         assert tracker.record_dpatch_attack(True) is False
         assert tracker.confirmed_attack_alert is False
 
-        # Frame 2: Attack detected
+        # Frame 2: Attack detected (2/2)
         assert tracker.record_dpatch_attack(True) is False
         assert tracker.confirmed_attack_alert is False
 
-        # Frame 3: Attack detected -> K=3 / 3 -> True!
+        # Frame 3: Attack detected (3/3)
+        assert tracker.record_dpatch_attack(True) is False
+        assert tracker.confirmed_attack_alert is False
+
+        # Frame 4: Attack detected -> K=4 / 4 -> True!
         assert tracker.record_dpatch_attack(True) is True
         assert tracker.confirmed_attack_alert is True
 
-        # Frame 4 & 5: Clean frames -> sum is 3 of 5 -> True
-        assert tracker.record_dpatch_attack(False) is True
+        # Frame 5: Clean frame -> sum is 4 of 5 -> True
         assert tracker.record_dpatch_attack(False) is True
         assert tracker.confirmed_attack_alert is True
 
-        # Frame 6: Clean frame -> sum is 2 of 5 -> False
+        # Frame 6: Clean frame -> sum is 3 of 5 -> False
         assert tracker.record_dpatch_attack(False) is False
         assert tracker.confirmed_attack_alert is False
 
@@ -386,6 +603,51 @@ class TestByteTracker:
         assert len(tracks) == 1
         assert tracks[0].recovered_by_inpainting is True
         assert pytest.approx(tracks[0].delta_p_obj, abs=1e-3) == 0.38
+
+    def test_bytetrack_preserves_80_coco_classes_and_prevents_cross_class_association(self):
+        """ByteTracker tracks multi-class detections and prevents cross-class tracklet stealing."""
+        tracker = ByteTracker(track_thresh=0.40, low_thresh=0.15, match_thresh=0.7)
+
+        # Frame 0: Multiple distinct COCO classes detected with high confidence
+        p_det = Detection(bbox=np.array([100.0, 100.0, 200.0, 300.0]), confidence=0.88, class_id=0, class_name="person")
+        chair_det = Detection(bbox=np.array([300.0, 200.0, 400.0, 300.0]), confidence=0.78, class_id=56, class_name="chair")
+        phone_det = Detection(bbox=np.array([150.0, 150.0, 190.0, 190.0]), confidence=0.82, class_id=67, class_name="cell phone")
+        bottle_det = Detection(bbox=np.array([500.0, 100.0, 530.0, 200.0]), confidence=0.85, class_id=39, class_name="bottle")
+
+        tracks_0 = tracker.update([p_det, chair_det, phone_det, bottle_det], frame_idx=0)
+        assert len(tracks_0) == 4
+
+        track_map = {t.class_name: t for t in tracks_0}
+        assert "person" in track_map and track_map["person"].class_id == 0
+        assert "chair" in track_map and track_map["chair"].class_id == 56
+        assert "cell phone" in track_map and track_map["cell phone"].class_id == 67
+        assert "bottle" in track_map and track_map["bottle"].class_id == 39
+
+        person_tid = track_map["person"].track_id
+        chair_tid = track_map["chair"].track_id
+
+        # Frame 1: Low-confidence detection for person (conf=0.22 in range 0.15 <= conf < 0.40)
+        # and slightly moved chair (conf=0.75)
+        p_low = Detection(bbox=np.array([102.0, 101.0, 202.0, 301.0]), confidence=0.22, class_id=0, class_name="person")
+        chair_next = Detection(bbox=np.array([302.0, 201.0, 402.0, 301.0]), confidence=0.75, class_id=56, class_name="chair")
+
+        tracks_1 = tracker.update([p_low, chair_next], frame_idx=1)
+        assert len(tracks_1) == 2
+        t1_map = {t.class_name: t for t in tracks_1}
+
+        # Second tier association associates low confidence person to same track_id
+        assert t1_map["person"].track_id == person_tid
+        assert t1_map["chair"].track_id == chair_tid
+        assert t1_map["person"].class_name == "person"
+        assert t1_map["chair"].class_name == "chair"
+
+        # Frame 2: Cross-class collision test. A chair appears at exact previous location of lost phone.
+        # It must NOT associate with the cell phone tracklet because class IDs differ.
+        imposter_chair = Detection(bbox=np.array([150.0, 150.0, 190.0, 190.0]), confidence=0.80, class_id=56, class_name="chair")
+        tracks_2 = tracker.update([imposter_chair], frame_idx=2)
+        assert len(tracks_2) == 1
+        assert tracks_2[0].class_name == "chair"
+        assert tracks_2[0].class_id == 56
 
 
 # ============================================================================
@@ -685,3 +947,111 @@ class TestSpatialFeatureNormClipper:
 
         # Candidate ROI must yield elevated jpeg_recompression_delta
         assert clipper.jpeg_recompression_delta > 1.5
+
+    def test_border_activation_spikes_ignored_and_never_returned_in_rois(self):
+        """Synthetic activation spikes on the outer frame border (e.g., x=0 or y=0) are ignored and never returned in patch_rois."""
+        b, c, h, w = 1, 32, 16, 16
+        torch.manual_seed(42)
+        f_dummy = torch.ones((b, c, h, w), dtype=torch.float32) * 2.0
+
+        # Inject extreme synthetic activation spikes on the outer frame border (x=0, y=0, bottom, right)
+        f_dummy[0, :, 0, 5] = 90.0   # top edge (y=0)
+        f_dummy[0, :, 7, 0] = 85.0   # left edge (x=0)
+        f_dummy[0, :, 15, 10] = 95.0 # bottom edge (y=H-1)
+        f_dummy[0, :, 10, 15] = 80.0 # right edge (x=W-1)
+
+        clipper = SpatialFeatureNormClipper(alpha=2.0, image_size=(640, 640))
+        f_clipped = clipper(f_dummy)
+
+        # Output shape must be strictly preserved
+        assert f_clipped.shape == (b, c, h, w)
+
+        # Border spikes must be completely ignored (unclamped)
+        assert torch.allclose(f_clipped[0, :, 0, 5], f_dummy[0, :, 0, 5], atol=1e-5)
+        assert torch.allclose(f_clipped[0, :, 7, 0], f_dummy[0, :, 7, 0], atol=1e-5)
+        assert torch.allclose(f_clipped[0, :, 15, 10], f_dummy[0, :, 15, 10], atol=1e-5)
+        assert torch.allclose(f_clipped[0, :, 10, 15], f_dummy[0, :, 10, 15], atol=1e-5)
+
+        # Border spikes must NEVER be returned in patch_rois
+        assert len(clipper.patch_rois) == 0
+
+        # max_grid_norm_ratio must ignore border spikes and remain ~1.0 for uniform interior
+        assert clipper.max_grid_norm_ratio == pytest.approx(1.0, rel=0.1)
+
+    def test_border_spikes_ignored_while_interior_spikes_clamped_and_localized(self):
+        """Synthetic border spikes are ignored while interior spikes are clamped and localized."""
+        b, c, h, w = 1, 32, 16, 16
+        torch.manual_seed(42)
+        f_dummy = torch.ones((b, c, h, w), dtype=torch.float32) * 2.0
+
+        # 1. Border spikes: (y=0, x=5) and (y=8, x=0)
+        f_dummy[0, :, 0, 5] = 100.0
+        f_dummy[0, :, 8, 0] = 100.0
+
+        # 2. Interior spike: (y=8, x=8)
+        interior_spike_val = 60.0
+        f_dummy[0, :, 8, 8] = interior_spike_val
+
+        pre_interior_norm = float(torch.linalg.vector_norm(f_dummy[0, :, 8, 8], ord=2).item())
+
+        clipper = SpatialFeatureNormClipper(alpha=2.0, image_size=(640, 640))
+        f_clipped = clipper(f_dummy)
+
+        # Border spikes are ignored and unclamped
+        assert torch.allclose(f_clipped[0, :, 0, 5], f_dummy[0, :, 0, 5], atol=1e-5)
+        assert torch.allclose(f_clipped[0, :, 8, 0], f_dummy[0, :, 8, 0], atol=1e-5)
+
+        # Interior spike IS clamped
+        post_interior_norm = float(torch.linalg.vector_norm(f_clipped[0, :, 8, 8], ord=2).item())
+        tau = clipper.last_tau
+        assert post_interior_norm <= tau + 1e-4
+        assert post_interior_norm < pre_interior_norm
+
+        # Candidate patch_rois must be returned and localize the interior spike
+        assert len(clipper.patch_rois) > 0
+        best_roi = clipper.patch_rois[0]
+
+        # In 640x640: cell (8, 8) in 16x16 grid maps to (320, 320)
+        expected_x = 8.0 * (640.0 / w)
+        expected_y = 8.0 * (640.0 / h)
+        assert best_roi[0] <= expected_x <= best_roi[2]
+        assert best_roi[1] <= expected_y <= best_roi[3]
+
+        # Verify that candidate ROIs NEVER touch frame edges or have centers within 6% of frame edges
+        for roi in clipper.patch_rois:
+            x1, y1, x2, y2 = roi
+            # Not touching edges within 5px
+            assert x1 > 5.0 and y1 > 5.0
+            assert x2 < (640.0 - 5.0) and y2 < (640.0 - 5.0)
+
+            # Center not within 6% of frame edge
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            assert 0.06 * 640.0 <= cx <= 0.94 * 640.0
+            assert 0.06 * 640.0 <= cy <= 0.94 * 640.0
+
+    def test_candidate_roi_border_rejection_rules(self):
+        """_extract_candidate_rois masks out outer 6% and rejects ROIs near edges or with edge centers."""
+        clipper = SpatialFeatureNormClipper(image_size=(640, 640))
+        heatmap = np.zeros((640, 640), dtype=np.float32)
+
+        # 1. Anomaly on outer 6% border (top-left corner, x=0..30, y=0..30)
+        heatmap[0:30, 0:30] = 1.0
+
+        # 2. Anomaly touching right edge (x2 >= 635)
+        heatmap[200:260, 630:640] = 1.0
+
+        # 3. Anomaly with center within 6% border (x=10..36, y=200..260 -> cx = 23 < 38.4)
+        heatmap[200:260, 10:36] = 1.0
+
+        # 4. Valid interior anomaly (x=280..360, y=200..260 -> cx = 320, cy = 230)
+        heatmap[200:260, 280:360] = 1.0
+
+        rois = clipper._extract_candidate_rois(heatmap, min_area=16.0)
+
+        # Only the valid interior anomaly should survive
+        assert len(rois) == 1
+        x1, y1, x2, y2 = rois[0]
+        assert x1 >= 270 and x2 <= 370
+        assert y1 >= 190 and y2 <= 270
+

@@ -7,6 +7,7 @@
 // -------------------------------------------------------------------------
 const elements = {
   videoFeed: document.getElementById('liveVideoFeed'),
+  streamCanvas: document.getElementById('streamCanvas'),
   btnWebcam: document.getElementById('btnWebcam'),
   btnUploadVideo: document.getElementById('btnUploadVideo'),
   videoFileInput: document.getElementById('videoFileInput'),
@@ -105,7 +106,7 @@ function addAlertToFeed(alert) {
   const deltaP = alert.delta_p_obj !== undefined && alert.delta_p_obj !== null ? Number(alert.delta_p_obj).toFixed(2) : '0.00';
   const recoveryBadgeHtml = isRecovered
     ? `<span class="feature-tag highlight" style="background: rgba(6, 182, 212, 0.25); color: #06b6d4; border: 1px solid #06b6d4; font-weight: 700;">🛡 RECOVERED (ΔP: +${deltaP})</span>`
-    : `<span class="feature-tag" style="background: rgba(148, 163, 184, 0.15); color: #94a3b8;">RAW TARGET</span>`;
+    : `<span class="feature-tag" style="background: rgba(249, 115, 22, 0.15); color: #f97316; border: 1px solid #f97316; font-weight: 700;">ADVERSARIAL PATCH (ΔP: +${deltaP})</span>`;
 
   // Feature breakdown tags
   let featureTagsHtml = recoveryBadgeHtml;
@@ -125,19 +126,19 @@ function addAlertToFeed(alert) {
 
   card.innerHTML = `
     <div class="alert-top">
-      <span class="alert-cam-id">${alert.camera_id || 'CAM-01'} • Track #${alert.track_id}</span>
+      <span class="alert-cam-id">${alert.camera_id || 'CAM-01'} • Track #${alert.track_id} (${alert.class_name || 'person'})</span>
       <div class="alert-prob-pill">
-        <span>⚠</span> ${probPercent}% Attacker
+        <span>⚠</span> ${probPercent}% Attack Risk
       </div>
     </div>
     <div class="alert-content-row">
       <div class="alert-thumbnail-box" title="Click to inspect snapshot">
-        <img src="${thumbSrc}" alt="Attacker Snapshot">
+        <img src="${thumbSrc}" alt="Target Snapshot">
         <div class="alert-thumbnail-overlay"></div>
       </div>
       <div class="alert-details">
-        <div class="alert-track-info">${isRecovered ? "Actively Recovered Target (Inpainting Mitigation)" : "Attacker Detected (Adversarial Patch)"}</div>
-        <div class="alert-coords">Person Confidence: ${confPercent}% • BBox: ${bboxStr}</div>
+        <div class="alert-track-info" style="color: #ff6b8b; font-weight: 700;">PERSON (UNDER ATTACK)</div>
+        <div class="alert-coords">Confidence: ${confPercent}% • BBox: ${bboxStr}</div>
         <div class="alert-features">${featureTagsHtml}</div>
       </div>
     </div>
@@ -171,15 +172,16 @@ function openModal(alert, thumbSrc) {
 
   elements.modalImg.src = thumbSrc;
   elements.modalDetails.innerHTML = `
-    <div><strong>Classification:</strong> <span style="color: #ff2a5f; font-weight: 700;">ATTACKER</span> (Adversarial Optical Pattern Detected)</div>
+    <div><strong>Classification:</strong> <span style="color: #ff2a5f; font-weight: 700;">PERSON (UNDER ATTACK)</span> (Adversarial Optical Patch Detected)</div>
+    <div><strong>Patch Status:</strong> <span style="color: #f97316; font-weight: 700;">ADVERSARIAL PATCH (ΔP = +${deltaP})</span></div>
     <div><strong>Detection Status:</strong> ${isRecovered ? `<span style="color: #06b6d4; font-weight: 700;">ACTIVELY RECOVERED</span> (Inpainted Patch, Objectness Recovery ΔP_obj = +${deltaP})` : '<span style="color: #94a3b8; font-weight: 600;">RAW DETECTION</span>'}</div>
     <div><strong>Camera:</strong> ${alert.camera_id || 'CAM-01'}</div>
-    <div><strong>Track ID:</strong> #${alert.track_id}</div>
-    <div><strong>Attacker Probability:</strong> ${(alert.attack_probability * 100).toFixed(2)}%</div>
-    <div><strong>Person Detection Confidence:</strong> ${(alert.confidence * 100).toFixed(2)}%</div>
+    <div><strong>Track ID:</strong> #${alert.track_id} (${alert.class_name || 'person'})</div>
+    <div><strong>Attack Probability:</strong> ${(alert.attack_probability * 100).toFixed(2)}%</div>
+    <div><strong>Detection Confidence:</strong> ${(alert.confidence * 100).toFixed(2)}%</div>
     <div><strong>Bounding Box Coordinates:</strong> [${alert.bbox ? alert.bbox.join(', ') : '0, 0, 0, 0'}]</div>
     <div><strong>Timestamp:</strong> ${alert.created_at || new Date().toISOString()}</div>
-    <div style="margin-top: 8px;"><strong>Forensic Assessment:</strong> High spatial chromatic variance and high-frequency edge gradients detected on human torso, causing sudden confidence attenuation in YOLOv8n backbone. Flagged for optical mitigation and persistence verification.</div>
+    <div style="margin-top: 8px;"><strong>Forensic Assessment:</strong> High spatial chromatic variance and high-frequency edge gradients detected on human torso, causing sudden confidence attenuation in YOLO backbone. Flagged for optical mitigation and persistence verification.</div>
   `;
   elements.snapshotModal.classList.add('open');
 }
@@ -271,11 +273,103 @@ function scheduleReconnect() {
   }
 }
 
+function drawDetectionOverlay(detections) {
+  if (!elements.streamCanvas || !elements.videoFeed) return;
+  const canvas = elements.streamCanvas;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  const rect = elements.videoFeed.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return;
+
+  if (canvas.width !== Math.round(rect.width) || canvas.height !== Math.round(rect.height)) {
+    canvas.width = Math.round(rect.width);
+    canvas.height = Math.round(rect.height);
+  }
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!detections || !Array.isArray(detections) || detections.length === 0) return;
+
+  const scaleX = canvas.width / (elements.videoFeed.naturalWidth || 640);
+  const scaleY = canvas.height / (elements.videoFeed.naturalHeight || 480);
+
+  for (const det of detections) {
+    const bbox = det.bbox;
+    if (!bbox || bbox.length < 4) continue;
+    const x1 = bbox[0] * scaleX;
+    const y1 = bbox[1] * scaleY;
+    const w = (bbox[2] - bbox[0]) * scaleX;
+    const h = (bbox[3] - bbox[1]) * scaleY;
+
+    if (det.confirmed_attack_alert) {
+      // 1. Red bounding box for person under attack
+      ctx.strokeStyle = '#ff2a5f';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(x1, y1, w, h);
+
+      // Label banner: PERSON (UNDER ATTACK)
+      ctx.fillStyle = '#ff2a5f';
+      const label = 'PERSON (UNDER ATTACK)';
+      ctx.font = 'bold 12px Inter, sans-serif';
+      const textWidth = ctx.measureText(label).width;
+      ctx.fillRect(x1, Math.max(0, y1 - 22), textWidth + 10, 22);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(label, x1 + 5, Math.max(15, y1 - 6));
+
+      // 2. Distinct orange/magenta box around patch_roi inside torso
+      ctx.strokeStyle = '#f97316';
+      ctx.lineWidth = 2;
+      let px = x1 + w * 0.25;
+      let py = y1 + h * 0.20;
+      let pw = w * 0.50;
+      let ph = h * 0.35;
+      if (det.patch_roi && det.patch_roi.length >= 4) {
+        px = det.patch_roi[0] * scaleX;
+        py = det.patch_roi[1] * scaleY;
+        pw = (det.patch_roi[2] - det.patch_roi[0]) * scaleX;
+        ph = (det.patch_roi[3] - det.patch_roi[1]) * scaleY;
+      }
+      ctx.strokeRect(px, py, pw, ph);
+
+      ctx.fillStyle = '#f97316';
+      const deltaP = Number(det.delta_p_obj || 0).toFixed(2);
+      const patchLabel = `ADVERSARIAL PATCH (ΔP=${deltaP})`;
+      ctx.font = 'bold 10px JetBrains Mono, monospace';
+      const patchWidth = ctx.measureText(patchLabel).width;
+      ctx.fillRect(px, Math.max(0, py - 18), patchWidth + 8, 18);
+      ctx.fillStyle = '#000000';
+      ctx.fillText(patchLabel, px + 4, Math.max(13, py - 4));
+    } else {
+      // Standard green/blue with native YOLO class name and confidence (e.g., 'person 0.89', 'cell phone 0.78')
+      // Never display the word "Attacker"
+      const isRecovered = Boolean(det.recovered_by_inpainting);
+      const color = isRecovered ? '#06b6d4' : '#10b981';
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x1, y1, w, h);
+
+      const className = det.class_name || 'person';
+      const conf = det.confidence !== undefined ? det.confidence.toFixed(2) : '0.00';
+      const label = `${className} ${conf}`;
+
+      ctx.fillStyle = color;
+      ctx.font = 'bold 11px Inter, sans-serif';
+      const textWidth = ctx.measureText(label).width;
+      ctx.fillRect(x1, Math.max(0, y1 - 20), textWidth + 8, 20);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(label, x1 + 4, Math.max(14, y1 - 5));
+    }
+  }
+}
+
 function handleWsMessage(msg) {
   if (msg.event === 'init_state' || msg.event === 'telemetry_update') {
     if (msg.metrics) updateMetricsUI(msg.metrics);
+    if (msg.detections) drawDetectionOverlay(msg.detections);
+  } else if (msg.event === 'frame_telemetry') {
+    if (msg.detections) drawDetectionOverlay(msg.detections);
   } else if (msg.event === 'attack_alert') {
-    if (msg.data) addAlertToFeed(msg.data);
+    if (msg.data && msg.data.confirmed_attack_alert) addAlertToFeed(msg.data);
     if (msg.metrics) updateMetricsUI(msg.metrics);
   }
 }

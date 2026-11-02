@@ -48,6 +48,8 @@ class Detection(NamedTuple):
     class_name: str
     delta_p_obj: float = 0.0
     recovered_by_inpainting: bool = False
+    is_attack: bool = False
+    patch_roi: Optional[Sequence[float]] = None
 
     @property
     def area(self) -> float:
@@ -62,6 +64,29 @@ class Detection(NamedTuple):
         w = max(1e-4, float(self.bbox[2] - self.bbox[0]))
         h = max(1e-4, float(self.bbox[3] - self.bbox[1]))
         return w / h
+
+    def to_dict(self) -> dict:
+        """Return dictionary representation of detection."""
+        return {
+            "bbox": self.bbox.tolist() if isinstance(self.bbox, np.ndarray) else list(self.bbox),
+            "confidence": float(self.confidence),
+            "class_id": int(self.class_id),
+            "class_name": str(self.class_name),
+            "delta_p_obj": float(self.delta_p_obj),
+            "recovered_by_inpainting": bool(self.recovered_by_inpainting),
+            "is_attack": bool(self.is_attack),
+            "patch_roi": list(self.patch_roi) if self.patch_roi is not None else None,
+        }
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, str):
+            if hasattr(self, key):
+                return getattr(self, key)
+            raise KeyError(key)
+        return tuple.__getitem__(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
 
 
 from src.detection.feature_extractor import SpatialFeatureNormClipper
@@ -101,6 +126,66 @@ def box_overlaps(box1: Sequence[float], box2: Sequence[float]) -> bool:
     x2 = min(float(box1[2]), float(box2[2]))
     y2 = min(float(box1[3]), float(box2[3]))
     return bool(x2 > x1 and y2 > y1)
+
+
+def is_near_frame_edge(
+    box: Sequence[float],
+    frame_shape: Sequence[int],
+    margin: float = 0.05,
+) -> bool:
+    """Check if bounding box touches or is near the outer frame boundary.
+
+    Returns True if x1 <= margin*W, y1 <= margin*H, x2 >= (1-margin)*W, or y2 >= (1-margin)*H.
+    """
+    h, w = float(frame_shape[0]), float(frame_shape[1])
+    x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+    return bool(
+        x1 <= margin * w
+        or y1 <= margin * h
+        or x2 >= (1.0 - margin) * w
+        or y2 >= (1.0 - margin) * h
+    )
+
+
+def is_inside_torso(
+    patch_box: Sequence[float],
+    person_box: Sequence[float],
+) -> bool:
+    """Check if candidate patch ROI lies strictly inside the person's torso region.
+
+    Returns True ONLY if the center of patch_box lies horizontally within
+    [px1 + 0.15*pw, px2 - 0.15*pw] and vertically within [py1 + 0.15*ph, py2 - 0.20*ph],
+    and the patch area is between 4% and 45% of the person box area.
+    """
+    px1, py1, px2, py2 = float(person_box[0]), float(person_box[1]), float(person_box[2]), float(person_box[3])
+    pw = max(0.0, px2 - px1)
+    ph = max(0.0, py2 - py1)
+    person_area = pw * ph
+    if person_area <= 0.0:
+        return False
+
+    rx1, ry1, rx2, ry2 = float(patch_box[0]), float(patch_box[1]), float(patch_box[2]), float(patch_box[3])
+    rw = max(0.0, rx2 - rx1)
+    rh = max(0.0, ry2 - ry1)
+    patch_area = rw * rh
+    if patch_area <= 0.0:
+        return False
+
+    rcx = (rx1 + rx2) / 2.0
+    rcy = (ry1 + ry2) / 2.0
+
+    min_x = px1 + 0.15 * pw
+    max_x = px2 - 0.15 * pw
+    min_y = py1 + 0.15 * ph
+    max_y = py2 - 0.20 * ph
+
+    area_ratio = patch_area / person_area
+
+    return bool(
+        min_x <= rcx <= max_x
+        and min_y <= rcy <= max_y
+        and 0.04 <= area_ratio <= 0.45
+    )
 
 
 def neutralize_patch_regions(
@@ -161,6 +246,8 @@ class YOLOv8ONNXDetector:
     """
 
     neutralize_patch_regions = staticmethod(neutralize_patch_regions)
+    is_near_frame_edge = staticmethod(is_near_frame_edge)
+    is_inside_torso = staticmethod(is_inside_torso)
 
     def __init__(
         self,
@@ -168,12 +255,14 @@ class YOLOv8ONNXDetector:
         input_size: Tuple[int, int] = (480, 480),
         conf_threshold: float = 0.25,
         iou_threshold: float = 0.45,
-        target_classes: Optional[Sequence[int]] = (0,),
+        target_classes: Optional[Sequence[int]] = None,
         num_threads: Optional[int] = None,
         provider: str = "CPUExecutionProvider",
         session: Optional[Any] = None,
         model: Optional[Any] = None,
         clipper: Optional[SpatialFeatureNormClipper] = None,
+        patch_model: Optional[Any] = None,
+        patch_model_path: Optional[Union[str, Path]] = "models/ad_yolo_best.pt",
     ) -> None:
         self.model_path = Path(model_path)
         self.input_size = input_size
@@ -185,6 +274,19 @@ class YOLOv8ONNXDetector:
         # 1. Register SpatialFeatureNormClipper hook onto YOLO model during initialization
         self.clipper = clipper or SpatialFeatureNormClipper(image_size=self.input_size)
         self.model = model
+
+        # Custom secondary patch model
+        self.patch_model_path = Path(patch_model_path) if patch_model_path is not None else Path("models/ad_yolo_best.pt")
+        self.patch_model = patch_model
+        if self.patch_model is None and self.patch_model_path.exists():
+            try:
+                from ultralytics import YOLO
+
+                self.patch_model = YOLO(str(self.patch_model_path))
+                logger.info("Loaded custom patch detector from %s", self.patch_model_path)
+            except Exception as exc:
+                logger.warning("Could not load patch model from %s: %s", self.patch_model_path, exc)
+                self.patch_model = None
 
         # If a PyTorch YOLO model or .pt path is provided, attach the clipper hook
         if self.model is not None:
@@ -308,6 +410,29 @@ class YOLOv8ONNXDetector:
         )
         return padded, scale, (pad_w, pad_h)
 
+    def predict_patch_rois(
+        self, frame: np.ndarray, conf_threshold: float = 0.25
+    ) -> List[List[float]]:
+        """Predict tight adversarial_patch bounding boxes using secondary patch model if available."""
+        if self.patch_model is None or frame is None or frame.size == 0:
+            return []
+        try:
+            results = self.patch_model.predict(
+                source=frame,
+                conf=conf_threshold,
+                device="cpu",
+                verbose=False,
+            )
+            rois: List[List[float]] = []
+            if results and len(results) > 0 and results[0].boxes is not None:
+                xyxy = results[0].boxes.xyxy.cpu().numpy()
+                for b in xyxy:
+                    rois.append([float(b[0]), float(b[1]), float(b[2]), float(b[3])])
+            return rois
+        except Exception as exc:
+            logger.warning("Error running patch_model inference: %s", exc)
+            return []
+
     def _detect_pytorch(
         self, frame: np.ndarray, conf_threshold: Optional[float] = None
     ) -> List[Detection]:
@@ -333,16 +458,26 @@ class YOLOv8ONNXDetector:
         xyxy = boxes.xyxy.cpu().numpy()
         confs = boxes.conf.cpu().numpy()
         cls_ids = boxes.cls.cpu().numpy()
+        names_dict = getattr(self.model, "names", None)
 
         for box, conf, cid in zip(xyxy, confs, cls_ids):
             c_int = int(cid)
-            name = COCO_CLASSES[c_int] if c_int < len(COCO_CLASSES) else f"class_{c_int}"
+            if names_dict and c_int in names_dict:
+                name = str(names_dict[c_int])
+            elif c_int < len(COCO_CLASSES):
+                name = COCO_CLASSES[c_int]
+            else:
+                name = f"class_{c_int}"
             detections.append(
                 Detection(
                     bbox=box.astype(np.float32),
                     confidence=float(conf),
                     class_id=c_int,
                     class_name=name,
+                    delta_p_obj=0.0,
+                    recovered_by_inpainting=False,
+                    is_attack=False,
+                    patch_roi=None,
                 )
             )
         return detections
@@ -461,16 +596,26 @@ class YOLOv8ONNXDetector:
         )
 
         detections: List[Detection] = []
+        names_dict = getattr(self.model, "names", None)
         if len(nms_indices) > 0:
             for i in nms_indices.flatten():
                 cls_id = classes_for_nms[i]
-                cls_name = COCO_CLASSES[cls_id] if cls_id < len(COCO_CLASSES) else f"class_{cls_id}"
+                if names_dict and cls_id in names_dict:
+                    cls_name = str(names_dict[cls_id])
+                elif cls_id < len(COCO_CLASSES):
+                    cls_name = COCO_CLASSES[cls_id]
+                else:
+                    cls_name = f"class_{cls_id}"
                 detections.append(
                     Detection(
                         bbox=coords_for_nms[i],
                         confidence=scores_for_nms[i],
                         class_id=cls_id,
                         class_name=cls_name,
+                        delta_p_obj=0.0,
+                        recovered_by_inpainting=False,
+                        is_attack=False,
+                        patch_roi=None,
                     )
                 )
 
@@ -479,27 +624,49 @@ class YOLOv8ONNXDetector:
     def detect_with_recovery(
         self,
         frame: np.ndarray,
-        conf_thresh: float = 0.4,
-        low_conf_thresh: float = 0.12,
+        conf_thresh: float = 0.40,
+        low_conf_thresh: float = 0.15,
         patch_rois: Optional[Sequence[Sequence[float]]] = None,
     ) -> List[Detection]:
-        """Active Two-Pass 'Detect-Neutralize-Redetect' pipeline.
+        """Active Two-Pass 'Detect-Neutralize-Redetect' pipeline with strict edge/torso guards.
 
         Recovers persons missed due to Thys et al. adversarial patch objectness suppression:
         1. Pass 1: Run YOLO inference on raw frame using low_conf_thresh.
-           Separate high-confidence person detections (conf >= conf_thresh),
-           low-confidence suppressed candidates (low_conf_thresh <= conf < conf_thresh),
-           and candidate patch_rois (from dedicated 'patch' class or feature_extractor anomaly ROIs).
-        2. Trigger Condition: If patch_rois is non-empty AND (any patch_roi does not have
-           a high-confidence person box containing it, OR overlaps with a low-confidence candidate):
-        3. Pass 2: Inpaint patch regions and re-run YOLO inference on the neutralized frame.
-        4. Calculate Causal Objectness Recovery (\\Delta P_{obj}): For each person detected in Pass 2,
-           match with Pass 1 boxes via IoU: delta_p_obj = conf_pass2 - conf_pass1 (0.0 if missed).
-        5. Merge Pass 1 and Pass 2 person detections using NMS, attaching delta_p_obj and
-           recovered_by_inpainting to detection metadata.
+           Keep all non-person COCO detections untouched with is_attack=False.
+           Separate high-confidence persons and low-confidence suppressed candidates.
+        2. Collect candidate patch_rois (from self.patch_model if loaded, clipper from
+           feature_extractor.py, or caller), filtering out any ROI near frame edge.
+        3. Pass 2 Trigger: Only run Telea Inpainting if a valid interior patch_roi overlaps
+           a person box (not near frame edge) via is_inside_torso, OR overlaps a low-confidence
+           suppressed interior person candidate.
+        4. Pass 2: Inpaint patch regions and re-run YOLO inference on neutralized frame.
+        5. Calculate Causal Objectness Recovery (\\Delta P_{obj}): delta_p_obj = conf_pass2 - conf_pass1.
+           Merge recovered person boxes via NMS and attach delta_p_obj, patch_roi, and
+           recovered_by_inpainting to the detection metadata.
         """
-        # Pass 1: Low-threshold proposal generation
+        if frame is None or frame.size == 0:
+            return []
+
+        frame_shape = frame.shape[:2]
+
+        # Pass 1: Proposal generation with low confidence threshold
         pass1_all = self.detect(frame, conf_threshold=low_conf_thresh)
+
+        # Preserve all non-person COCO detections untouched with is_attack=False
+        non_person_detections = [
+            Detection(
+                bbox=d.bbox,
+                confidence=float(d.confidence),
+                class_id=d.class_id,
+                class_name=d.class_name,
+                delta_p_obj=0.0,
+                recovered_by_inpainting=False,
+                is_attack=False,
+                patch_roi=None,
+            )
+            for d in pass1_all
+            if d.class_id != 0 and d.class_name != "person" and d.confidence >= conf_thresh
+        ]
 
         # Separate persons by confidence tier
         high_conf_persons = [
@@ -513,33 +680,62 @@ class YOLOv8ONNXDetector:
         ]
 
         # Collect candidate patch ROIs
-        all_patch_rois: List[List[float]] = []
+        raw_patch_rois: List[List[float]] = []
         if patch_rois is not None:
-            all_patch_rois.extend([list(r) for r in patch_rois])
+            raw_patch_rois.extend([list(r) for r in patch_rois])
+
+        if hasattr(self, "patch_model") and self.patch_model is not None:
+            raw_patch_rois.extend(self.predict_patch_rois(frame))
 
         if hasattr(self, "clipper") and self.clipper is not None and self.clipper.patch_rois:
-            all_patch_rois.extend([list(r) for r in self.clipper.patch_rois])
+            raw_patch_rois.extend([list(r) for r in self.clipper.patch_rois])
 
         for det in pass1_all:
             if det.class_name.lower() in ("patch", "adversarial_patch") or det.class_id == 80:
-                all_patch_rois.append(det.bbox.tolist())
+                raw_patch_rois.append(det.bbox.tolist() if isinstance(det.bbox, np.ndarray) else list(det.bbox))
 
-        # Trigger Condition:
-        # If patch_rois is non-empty AND (any patch_roi does not have a high-confidence person box
-        # containing it, OR overlaps with a low-confidence suppressed person candidate)
+        # Filter out candidate patch ROIs near the frame edge (margin=0.05)
+        valid_patch_rois: List[List[float]] = [
+            roi for roi in raw_patch_rois
+            if len(roi) >= 4 and not is_near_frame_edge(roi, frame_shape, margin=0.05)
+        ]
+
+        # Pass 2 Trigger Condition:
+        # Only run Pass 2 Telea Inpainting if a valid interior patch_roi overlaps a person box
+        # (that is NOT near the frame edge) via is_inside_torso, OR overlaps a low-confidence
+        # suppressed interior person candidate.
         should_trigger = False
-        if all_patch_rois:
-            for roi in all_patch_rois:
-                contained_in_high = any(box_contains(p.bbox, roi) for p in high_conf_persons)
-                overlaps_with_low = any(box_overlaps(roi, p.bbox) for p in low_conf_persons)
+        triggering_rois: List[List[float]] = []
 
-                if (not contained_in_high) or overlaps_with_low:
-                    should_trigger = True
+        for roi in valid_patch_rois:
+            matched = False
+
+            # Check high-confidence persons (not near frame edge) via is_inside_torso
+            for p in high_conf_persons:
+                if not is_near_frame_edge(p.bbox, frame_shape, margin=0.05) and is_inside_torso(roi, p.bbox):
+                    matched = True
                     break
 
+            # Check low-confidence suppressed interior person candidates
+            if not matched:
+                for lp in low_conf_persons:
+                    if not is_near_frame_edge(lp.bbox, frame_shape, margin=0.05) and (
+                        is_inside_torso(roi, lp.bbox) or box_overlaps(roi, lp.bbox)
+                    ):
+                        matched = True
+                        break
+
+            # Fallback for complete evasion (where person was completely missed in Pass 1 and patch ROIs / patch model provided)
+            if not matched and not high_conf_persons and not low_conf_persons:
+                if patch_rois is not None or (hasattr(self, "patch_model") and self.patch_model is not None):
+                    matched = True
+
+            if matched:
+                should_trigger = True
+                triggering_rois.append(roi)
+
         if not should_trigger:
-            # No suppressed person to recover; return high-confidence detections directly
-            return [
+            pass1_persons = [
                 Detection(
                     bbox=d.bbox,
                     confidence=float(d.confidence),
@@ -547,13 +743,16 @@ class YOLOv8ONNXDetector:
                     class_name=d.class_name,
                     delta_p_obj=0.0,
                     recovered_by_inpainting=False,
+                    is_attack=False,
+                    patch_roi=None,
                 )
-                for d in pass1_all
-                if d.confidence >= conf_thresh
+                for d in high_conf_persons
             ]
+            return pass1_persons + non_person_detections
 
-        # Pass 2: Inpaint patch regions and redetect
-        inpainted_frame = self.neutralize_patch_regions(frame, all_patch_rois, dilate_ratio=0.10)
+        # Pass 2: Telea Inpainting (radius=5, dilated by 10%) and redetect
+        inpaint_rois = triggering_rois if triggering_rois else valid_patch_rois
+        inpainted_frame = neutralize_patch_regions(frame, inpaint_rois, dilate_ratio=0.10)
         pass2_all = self.detect(inpainted_frame, conf_threshold=low_conf_thresh)
         pass2_persons = [d for d in pass2_all if d.class_id == 0 or d.class_name == "person"]
 
@@ -576,6 +775,15 @@ class YOLOv8ONNXDetector:
             delta_p_obj = float(d2.confidence - conf_pass1)
             recovered = bool(conf_pass1 < conf_thresh and d2.confidence >= conf_thresh)
 
+            # Associate corresponding patch ROI
+            matched_patch: Optional[List[float]] = None
+            for r in inpaint_rois:
+                if is_inside_torso(r, d2.bbox) or box_overlaps(r, d2.bbox):
+                    matched_patch = r
+                    break
+            if matched_patch is None and inpaint_rois:
+                matched_patch = inpaint_rois[0]
+
             pass2_enriched.append(
                 Detection(
                     bbox=d2.bbox,
@@ -584,6 +792,8 @@ class YOLOv8ONNXDetector:
                     class_name=d2.class_name,
                     delta_p_obj=round(delta_p_obj, 4),
                     recovered_by_inpainting=recovered,
+                    is_attack=bool(recovered or delta_p_obj >= 0.15),
+                    patch_roi=matched_patch,
                 )
             )
 
@@ -596,14 +806,15 @@ class YOLOv8ONNXDetector:
                 class_name=d.class_name,
                 delta_p_obj=0.0,
                 recovered_by_inpainting=False,
+                is_attack=False,
+                patch_roi=None,
             )
             for d in high_conf_persons
-            if d.confidence >= conf_thresh
         ]
         pass2_candidates = [d for d in pass2_enriched if d.confidence >= conf_thresh]
 
-        all_candidates = pass1_candidates + pass2_candidates
-        all_candidates.sort(key=lambda d: d.confidence, reverse=True)
+        all_candidates = pass2_candidates + pass1_candidates
+        all_candidates.sort(key=lambda d: (d.recovered_by_inpainting, d.confidence), reverse=True)
 
         merged_persons: List[Detection] = []
         while all_candidates:
@@ -614,34 +825,25 @@ class YOLOv8ONNXDetector:
                 if bbox_iou(best.bbox, c.bbox) < self.iou_threshold
             ]
 
-        # Preserve any non-person high-confidence detections from Pass 1
-        other_detections = [
-            Detection(
-                bbox=d.bbox,
-                confidence=float(d.confidence),
-                class_id=d.class_id,
-                class_name=d.class_name,
-                delta_p_obj=0.0,
-                recovered_by_inpainting=False,
-            )
-            for d in pass1_all
-            if d.class_id != 0 and d.class_name != "person" and d.confidence >= conf_thresh
-        ]
-
-        return merged_persons + other_detections
+        return merged_persons + non_person_detections
 
 
 class UltralyticsPyTorchWrapper:
     """Wrapper for PyTorch (.pt) weights using Ultralytics with Active Two-Pass Recovery."""
 
     neutralize_patch_regions = staticmethod(neutralize_patch_regions)
+    is_near_frame_edge = staticmethod(is_near_frame_edge)
+    is_inside_torso = staticmethod(is_inside_torso)
 
     def __init__(
         self,
-        model_path: Union[str, Path, Any],
+        model_path: Union[str, Path, Any] = "yolov8n.pt",
         conf_threshold: float = 0.25,
         iou_threshold: float = 0.45,
+        target_classes: Optional[Sequence[int]] = None,
         clipper: Optional[SpatialFeatureNormClipper] = None,
+        patch_model: Optional[Any] = None,
+        patch_model_path: Optional[Union[str, Path]] = "models/ad_yolo_best.pt",
     ) -> None:
         try:
             from ultralytics import YOLO
@@ -659,6 +861,18 @@ class UltralyticsPyTorchWrapper:
 
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
+        self.target_classes = set(target_classes) if target_classes is not None else None
+
+        # Custom secondary patch model
+        self.patch_model_path = Path(patch_model_path) if patch_model_path is not None else Path("models/ad_yolo_best.pt")
+        self.patch_model = patch_model
+        if self.patch_model is None and self.patch_model_path.exists():
+            try:
+                self.patch_model = YOLO(str(self.patch_model_path))
+                logger.info("Loaded custom patch detector from %s", self.patch_model_path)
+            except Exception as exc:
+                logger.warning("Could not load patch model from %s: %s", self.patch_model_path, exc)
+                self.patch_model = None
 
         # Register SpatialFeatureNormClipper hook
         self.clipper = clipper or SpatialFeatureNormClipper()
@@ -673,6 +887,29 @@ class UltralyticsPyTorchWrapper:
         except Exception as exc:
             logger.warning("Could not attach clipper hook: %s", exc)
 
+    def predict_patch_rois(
+        self, frame: np.ndarray, conf_threshold: float = 0.25
+    ) -> List[List[float]]:
+        """Predict tight adversarial_patch bounding boxes using secondary patch model if available."""
+        if self.patch_model is None or frame is None or frame.size == 0:
+            return []
+        try:
+            results = self.patch_model.predict(
+                source=frame,
+                conf=conf_threshold,
+                device="cpu",
+                verbose=False,
+            )
+            rois: List[List[float]] = []
+            if results and len(results) > 0 and results[0].boxes is not None:
+                xyxy = results[0].boxes.xyxy.cpu().numpy()
+                for b in xyxy:
+                    rois.append([float(b[0]), float(b[1]), float(b[2]), float(b[3])])
+            return rois
+        except Exception as exc:
+            logger.warning("Error running patch_model inference: %s", exc)
+            return []
+
     def detect(
         self, image: np.ndarray, conf_threshold: Optional[float] = None
     ) -> List[Detection]:
@@ -680,11 +917,12 @@ class UltralyticsPyTorchWrapper:
         if self.clipper is not None:
             self.clipper.set_image(image)
 
+        classes = list(self.target_classes) if self.target_classes is not None else None
         results = self.model.predict(
             source=image,
             conf=thresh,
             iou=self.iou_threshold,
-            classes=[0],  # Person class only
+            classes=classes,  # All 80 COCO classes by default
             device="cpu",
             verbose=False,
         )
@@ -699,14 +937,27 @@ class UltralyticsPyTorchWrapper:
         xyxy = boxes.xyxy.cpu().numpy()
         confs = boxes.conf.cpu().numpy()
         cls_ids = boxes.cls.cpu().numpy()
+        names_dict = getattr(self.model, "names", None)
 
         for box, conf, cid in zip(xyxy, confs, cls_ids):
+            c_int = int(cid)
+            if names_dict and c_int in names_dict:
+                name = str(names_dict[c_int])
+            elif c_int < len(COCO_CLASSES):
+                name = COCO_CLASSES[c_int]
+            else:
+                name = f"class_{c_int}"
+
             detections.append(
                 Detection(
                     bbox=box.astype(np.float32),
                     confidence=float(conf),
-                    class_id=int(cid),
-                    class_name="person",
+                    class_id=c_int,
+                    class_name=name,
+                    delta_p_obj=0.0,
+                    recovered_by_inpainting=False,
+                    is_attack=False,
+                    patch_roi=None,
                 )
             )
         return detections
@@ -715,3 +966,17 @@ class UltralyticsPyTorchWrapper:
 
 
 YOLOv8PyTorchDetector = UltralyticsPyTorchWrapper
+
+__all__ = [
+    "COCO_CLASSES",
+    "Detection",
+    "YOLOv8ONNXDetector",
+    "YOLOv8PyTorchDetector",
+    "UltralyticsPyTorchWrapper",
+    "bbox_iou",
+    "box_contains",
+    "box_overlaps",
+    "is_near_frame_edge",
+    "is_inside_torso",
+    "neutralize_patch_regions",
+]

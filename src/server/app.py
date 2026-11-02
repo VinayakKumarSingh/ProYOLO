@@ -105,8 +105,14 @@ class FrameDetectionItem(BaseModel):
     bbox: List[float] = Field(..., min_length=4, max_length=4)
     confidence: float
     is_attack: bool = False
+    confirmed_attack_alert: bool = False
     attack_probability: float = 0.0
     label: Optional[str] = None
+    class_id: Optional[int] = 0
+    class_name: Optional[str] = "person"
+    delta_p_obj: float = 0.0
+    patch_roi: Optional[List[float]] = None
+    recovered_by_inpainting: bool = False
 
 
 class FrameTelemetry(BaseModel):
@@ -251,7 +257,9 @@ ws_manager = ConnectionManager()
 # ---------------------------------------------------------------------------
 
 async def on_stream_alert(alert_data: Dict[str, Any]) -> None:
-    """Callback when stream_engine flags an adversarial attack."""
+    """Callback when stream_engine flags an adversarial attack (only when confirmed_attack_alert == True)."""
+    if not alert_data.get("confirmed_attack_alert", False):
+        return
     try:
         with next(get_db()) as db:
             save_alert(
@@ -289,6 +297,7 @@ async def on_stream_telemetry(metrics_data: Dict[str, Any]) -> None:
     await ws_manager.broadcast({
         "event": "telemetry_update",
         "metrics": telemetry_state.to_dict(),
+        "detections": metrics_data.get("detections", []),
     })
 
 

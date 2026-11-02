@@ -350,7 +350,7 @@ def test_websocket_alert_event_emission(sync_client: TestClient):
 
 
 def test_stream_engine_temporal_persistence_and_redis_alert():
-    """Verify StreamEngine enforces K=3 out of N=5 temporal persistence before dispatching alerts."""
+    """Verify StreamEngine enforces K=4 out of N=5 temporal persistence before dispatching alerts."""
     from unittest.mock import MagicMock
     from src.detection.detector import Detection
     from src.classifier.attack_classifier import AttackPrediction
@@ -399,6 +399,9 @@ def test_stream_engine_temporal_persistence_and_redis_alert():
     assert items[0]["confirmed_attack_alert"] is False
     assert items[0]["recovered_by_inpainting"] is True
     assert pytest.approx(items[0]["delta_p_obj"]) == 0.32
+    # Unconfirmed attack: label MUST be native class and conf, never "Attacker"
+    assert "Attacker" not in items[0]["label"]
+    assert items[0]["label"] == "person 0.85"
     alert_callback.assert_not_called()
     mock_redis.publish_alert.assert_not_called()
 
@@ -407,19 +410,101 @@ def test_stream_engine_temporal_persistence_and_redis_alert():
     alert_callback.assert_not_called()
     mock_redis.publish_alert.assert_not_called()
 
-    # Frame 3: Attack predicted (3/3 -> K=3 reached!) -> DOES dispatch alert!
+    # Frame 3: Attack predicted (3/3) -> should NOT dispatch alert yet (K=4 required)
     engine.process_frame(frame, timestamp=3.0)
+    alert_callback.assert_not_called()
+    mock_redis.publish_alert.assert_not_called()
+
+    # Frame 4: Attack predicted (4/4 -> K=4 reached!) -> DOES dispatch alert!
+    _, items_4 = engine.process_frame(frame, timestamp=4.0)
+    assert items_4[0]["confirmed_attack_alert"] is True
+    assert items_4[0]["label"] == "PERSON (UNDER ATTACK)"
     assert alert_callback.call_count == 1
     assert mock_redis.publish_alert.call_count == 1
 
     dispatched = alert_callback.call_args[0][0]
     assert dispatched["confirmed_attack_alert"] is True
+    assert dispatched["classification"] == "PERSON (UNDER ATTACK)"
     assert dispatched["recovered_by_inpainting"] is True
     assert pytest.approx(dispatched["delta_p_obj"]) == 0.32
     assert dispatched["attack_probability"] == 0.92
 
     redis_dispatched = mock_redis.publish_alert.call_args[0][0]
     assert redis_dispatched["confirmed_attack_alert"] is True
+    assert redis_dispatched["classification"] == "PERSON (UNDER ATTACK)"
     assert redis_dispatched["recovered_by_inpainting"] is True
     assert pytest.approx(redis_dispatched["delta_p_obj"]) == 0.32
+
+
+def test_stream_engine_multiclass_and_ui_rendering():
+    """Verify StreamEngine renders 80 COCO classes with native labels and clean threat UI."""
+    from unittest.mock import MagicMock
+    from src.detection.detector import Detection
+    from src.server.stream_engine import StreamEngine
+
+    mock_detector = MagicMock()
+    p_det = Detection(bbox=np.array([100.0, 100.0, 200.0, 300.0]), confidence=0.89, class_id=0, class_name="person")
+    phone_det = Detection(bbox=np.array([250.0, 150.0, 280.0, 200.0]), confidence=0.78, class_id=67, class_name="cell phone")
+    bottle_det = Detection(bbox=np.array([320.0, 200.0, 350.0, 290.0]), confidence=0.82, class_id=39, class_name="bottle")
+    chair_det = Detection(bbox=np.array([400.0, 300.0, 500.0, 450.0]), confidence=0.74, class_id=56, class_name="chair")
+
+    mock_detector.detect_with_recovery.return_value = [p_det, phone_det, bottle_det, chair_det]
+
+    mock_fe = MagicMock()
+    mock_classifier = MagicMock()
+    mock_redis = MagicMock()
+    alert_callback = MagicMock()
+
+    engine = StreamEngine(
+        detector=mock_detector,
+        feature_extractor=mock_fe,
+        classifier=mock_classifier,
+        redis_manager=mock_redis,
+        alert_callback=alert_callback,
+    )
+
+    frame = np.full((480, 640, 3), 120, dtype=np.uint8)
+
+    # Frame 0: Clean objects (no attacks)
+    annotated, items = engine.process_frame(frame, timestamp=1.0)
+    assert len(items) == 4
+
+    labels = {it["class_name"]: it["label"] for it in items}
+    assert labels["person"] == "person 0.89"
+    assert labels["cell phone"] == "cell phone 0.78"
+    assert labels["bottle"] == "bottle 0.82"
+    assert labels["chair"] == "chair 0.74"
+
+    # None of the unconfirmed boxes should have "Attacker"
+    for it in items:
+        assert "Attacker" not in it["label"]
+        assert it["confirmed_attack_alert"] is False
+
+    # No alerts dispatched for clean detections
+    alert_callback.assert_not_called()
+    mock_redis.publish_alert.assert_not_called()
+
+    # Verify _draw_detection_box directly
+    test_canvas = np.zeros((480, 640, 3), dtype=np.uint8)
+    # 1. Clean box
+    StreamEngine._draw_detection_box(
+        test_canvas,
+        track_id=1,
+        bbox=[100, 100, 200, 300],
+        conf=0.78,
+        confirmed_attack_alert=False,
+        class_name="cell phone",
+    )
+    # 2. Confirmed attack box with patch ROI
+    StreamEngine._draw_detection_box(
+        test_canvas,
+        track_id=2,
+        bbox=[300, 100, 450, 400],
+        conf=0.91,
+        confirmed_attack_alert=True,
+        delta_p_obj=0.35,
+        class_name="person",
+        patch_roi=[340, 160, 410, 260],
+    )
+    assert test_canvas.sum() > 0
 

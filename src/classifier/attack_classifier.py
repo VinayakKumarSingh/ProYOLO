@@ -50,6 +50,96 @@ CLEAN_FEATURE_BASELINES: Dict[str, Tuple[float, float]] = {
     "jpeg_recompression_delta": (1.0, 0.2),
 }
 
+# Empirical clean clothing thresholds for spatial/compression anomaly rejection
+CLEAN_CLOTHING_MAX_GRID_NORM_RATIO: float = 2.2
+CLEAN_CLOTHING_JPEG_DELTA: float = 2.0
+
+
+def check_is_near_frame_edge(
+    box: Sequence[float],
+    frame_shape: Sequence[int] = (640, 640),
+    margin: float = 0.05,
+) -> bool:
+    """Check if bounding box touches or is near the outer frame boundary.
+
+    Returns True if x1 <= margin*W, y1 <= margin*H, x2 >= (1-margin)*W, or y2 >= (1-margin)*H.
+    """
+    if len(box) < 4:
+        return False
+    h, w = float(frame_shape[0]), float(frame_shape[1])
+    x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+    return bool(
+        x1 <= margin * w
+        or y1 <= margin * h
+        or x2 >= (1.0 - margin) * w
+        or y2 >= (1.0 - margin) * h
+    )
+
+
+is_near_frame_edge = check_is_near_frame_edge
+
+
+def check_is_inside_torso(
+    patch_box: Sequence[float],
+    person_box: Sequence[float],
+) -> bool:
+    """Check if candidate patch ROI lies strictly inside the person's torso region.
+
+    Returns True ONLY if the center of patch_box lies horizontally within
+    [px1 + 0.15*pw, px2 - 0.15*pw] and vertically within [py1 + 0.15*ph, py2 - 0.20*ph],
+    and the patch area is between 4% and 45% of the person box area.
+    """
+    if len(patch_box) < 4 or len(person_box) < 4:
+        return False
+    px1, py1, px2, py2 = float(person_box[0]), float(person_box[1]), float(person_box[2]), float(person_box[3])
+    pw = max(0.0, px2 - px1)
+    ph = max(0.0, py2 - py1)
+    person_area = pw * ph
+    if person_area <= 0.0:
+        return False
+
+    rx1, ry1, rx2, ry2 = float(patch_box[0]), float(patch_box[1]), float(patch_box[2]), float(patch_box[3])
+    rw = max(0.0, rx2 - rx1)
+    rh = max(0.0, ry2 - ry1)
+    patch_area = rw * rh
+    if patch_area <= 0.0:
+        return False
+
+    rcx = (rx1 + rx2) / 2.0
+    rcy = (ry1 + ry2) / 2.0
+
+    min_x = px1 + 0.15 * pw
+    max_x = px2 - 0.15 * pw
+    min_y = py1 + 0.15 * ph
+    max_y = py2 - 0.20 * ph
+
+    area_ratio = patch_area / person_area
+
+    return bool(
+        min_x <= rcx <= max_x
+        and min_y <= rcy <= max_y
+        and 0.04 <= area_ratio <= 0.45
+    )
+
+
+is_inside_torso = check_is_inside_torso
+
+
+def is_in_central_frame(
+    box: Sequence[float],
+    frame_shape: Sequence[int] = (640, 640),
+    central_fraction: float = 0.85,
+) -> bool:
+    """Check if bounding box center lies inside the central fraction of the frame."""
+    if len(box) < 4:
+        return True
+    h, w = float(frame_shape[0]), float(frame_shape[1])
+    margin_x = (1.0 - central_fraction) / 2.0 * w
+    margin_y = (1.0 - central_fraction) / 2.0 * h
+    cx = (float(box[0]) + float(box[2])) / 2.0
+    cy = (float(box[1]) + float(box[3])) / 2.0
+    return bool(margin_x <= cx <= (w - margin_x) and margin_y <= cy <= (h - margin_y))
+
 
 class AttackPrediction(NamedTuple):
     """Result of real-time attack classifier inference."""
@@ -62,6 +152,8 @@ class AttackPrediction(NamedTuple):
     inference_latency_ms: float
     causal_verification_passed: bool = False
     delta_p_obj: float = 0.0
+    case_triggered: Optional[str] = None
+    patch_conf: float = 0.0
 
 
 class AttackClassifier:
@@ -78,9 +170,13 @@ class AttackClassifier:
         model_path: Optional[Union[str, Path]] = None,
         threshold: float = 0.65,
         model: Optional[Any] = None,
+        patch_model_path: Optional[Union[str, Path]] = "models/ad_yolo_best.pt",
+        patch_model: Optional[Any] = None,
     ) -> None:
         self.threshold = float(threshold)
         self.is_onnx = False
+        self.patch_model_path = Path(patch_model_path) if patch_model_path is not None else Path("models/ad_yolo_best.pt")
+        self.patch_model = patch_model
 
         if model is not None:
             self.model = model
@@ -109,6 +205,21 @@ class AttackClassifier:
 
         # Cache global model feature importances
         self.global_importances = self._extract_global_importances()
+
+    def load_patch_model(self) -> Optional[Any]:
+        """Lazily load fine-tuned Ad-YOLO patch detector (models/ad_yolo_best.pt)."""
+        if self.patch_model is not None:
+            return self.patch_model
+        if self.patch_model_path is not None and self.patch_model_path.exists():
+            try:
+                from ultralytics import YOLO
+
+                self.patch_model = YOLO(str(self.patch_model_path))
+                logger.info("Loaded fine-tuned Ad-YOLO patch model from %s", self.patch_model_path)
+            except Exception as exc:
+                logger.warning("Could not load patch model from %s: %s", self.patch_model_path, exc)
+                self.patch_model = None
+        return self.patch_model
 
     def _load_model(self, path: Path) -> Any:
         """Load model from .joblib or .onnx file."""
@@ -149,7 +260,24 @@ class AttackClassifier:
                 if i < len(norm_imps)
             }
 
-        # 2. If model is ONNX, check if companion joblib exists to read weights
+        # 2. From calibrated classifiers ensemble if present
+        if hasattr(self.model, "calibrated_classifiers_"):
+            imps = [
+                getattr(c, "estimator", c).feature_importances_
+                for c in self.model.calibrated_classifiers_
+                if hasattr(getattr(c, "estimator", c), "feature_importances_")
+            ]
+            if imps:
+                raw_imps = np.mean(imps, axis=0)
+                total = float(np.sum(raw_imps))
+                norm_imps = raw_imps / (total + 1e-6)
+                return {
+                    name: float(norm_imps[i])
+                    for i, name in enumerate(FEATURE_NAMES)
+                    if i < len(norm_imps)
+                }
+
+        # 3. If model is ONNX, check if companion joblib exists to read weights
         joblib_companion = Path("models/attack_classifier.joblib")
         if joblib_companion.exists():
             try:
@@ -163,40 +291,27 @@ class AttackClassifier:
                         for i, name in enumerate(FEATURE_NAMES)
                         if i < len(norm_imps)
                     }
+                if hasattr(jb, "calibrated_classifiers_"):
+                    imps = [
+                        getattr(c, "estimator", c).feature_importances_
+                        for c in jb.calibrated_classifiers_
+                        if hasattr(getattr(c, "estimator", c), "feature_importances_")
+                    ]
+                    if imps:
+                        raw_imps = np.mean(imps, axis=0)
+                        total = float(np.sum(raw_imps))
+                        norm_imps = raw_imps / (total + 1e-6)
+                        return {
+                            name: float(norm_imps[i])
+                            for i, name in enumerate(FEATURE_NAMES)
+                            if i < len(norm_imps)
+                        }
             except Exception:
                 pass
 
-        # 3. Default equal baseline importance
+        # 4. Default equal baseline importance
         equal_weight = 1.0 / float(len(FEATURE_NAMES))
         return {name: equal_weight for name in FEATURE_NAMES}
-
-    @staticmethod
-    def _check_patch_in_person(
-        patch_rois: Sequence[Sequence[float]],
-        person_bbox: Optional[Sequence[float]],
-    ) -> bool:
-        """Check if any candidate patch ROI overlaps or lies inside person bounding box."""
-        if person_bbox is None or not patch_rois:
-            # If no disjoint patch ROIs are explicitly specified, assume track upper body localization
-            return True
-
-        bx1, by1, bx2, by2 = (
-            float(person_bbox[0]),
-            float(person_bbox[1]),
-            float(person_bbox[2]),
-            float(person_bbox[3]),
-        )
-        for roi in patch_rois:
-            rx1, ry1, rx2, ry2 = float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3])
-            ix1 = max(rx1, bx1)
-            iy1 = max(ry1, by1)
-            ix2 = min(rx2, bx2)
-            iy2 = min(ry2, by2)
-            inter_w = max(0.0, ix2 - ix1)
-            inter_h = max(0.0, iy2 - iy1)
-            if (inter_w * inter_h) > 0.0:
-                return True
-        return False
 
     def predict(
         self,
@@ -208,6 +323,12 @@ class AttackClassifier:
         recovered_objects_count: int = 0,
         conf_drop: Optional[float] = None,
         max_grid_norm_ratio: Optional[float] = None,
+        jpeg_recompression_delta: Optional[float] = None,
+        class_name: str = "person",
+        patch_conf: float = 0.0,
+        patch_confs: Optional[Sequence[float]] = None,
+        frame_shape: Sequence[int] = (640, 640),
+        is_near_frame_edge: Optional[bool] = None,
     ) -> AttackPrediction:
         """Predict attack probability and evaluate Two-Stage Causal Verification Gate.
 
@@ -220,6 +341,12 @@ class AttackClassifier:
             recovered_objects_count: Number of suppressed objects recovered in Pass 2 inpainting.
             conf_drop: Optional explicit drop in tracked person confidence.
             max_grid_norm_ratio: Optional DPATCH grid norm ratio.
+            jpeg_recompression_delta: Optional JPEG recompression energy delta.
+            class_name: Detected object class name (must be 'person' to flag attack).
+            patch_conf: Detection confidence of candidate patch from models/ad_yolo_best.pt.
+            patch_confs: Sequence of detection confidences corresponding to candidate patch ROIs.
+            frame_shape: Frame dimensions (H, W) used for boundary margin checks.
+            is_near_frame_edge: Explicit override for boundary check.
 
         Returns:
             AttackPrediction containing attack flag, probability, and top contributing features.
@@ -229,11 +356,22 @@ class AttackClassifier:
 
         resolved_person_bbox = person_bbox
         resolved_delta_p_obj = float(delta_p_obj)
+        resolved_class_name = str(class_name)
+        resolved_patch_conf = float(patch_conf)
+
         all_patch_rois: List[Sequence[float]] = []
         if patch_roi is not None:
             all_patch_rois.append(patch_roi)
+            if len(patch_roi) >= 5 and resolved_patch_conf == 0.0:
+                resolved_patch_conf = float(patch_roi[4])
         if patch_rois:
-            all_patch_rois.extend(patch_rois)
+            for roi in patch_rois:
+                all_patch_rois.append(roi)
+                if len(roi) >= 5 and resolved_patch_conf == 0.0:
+                    resolved_patch_conf = max(resolved_patch_conf, float(roi[4]))
+
+        if patch_confs:
+            resolved_patch_conf = max(resolved_patch_conf, max(float(c) for c in patch_confs))
 
         if isinstance(features, FeaturePacket):
             raw_vec = features.feature_vector
@@ -247,6 +385,10 @@ class AttackClassifier:
                 conf_drop = float(features.feature_dict["conf_drop"])
             if max_grid_norm_ratio is None and "max_grid_norm_ratio" in features.feature_dict:
                 max_grid_norm_ratio = float(features.feature_dict["max_grid_norm_ratio"])
+            if jpeg_recompression_delta is None and "jpeg_recompression_delta" in features.feature_dict:
+                jpeg_recompression_delta = float(features.feature_dict["jpeg_recompression_delta"])
+            if hasattr(features, "class_name"):
+                resolved_class_name = str(getattr(features, "class_name"))
         elif isinstance(features, np.ndarray):
             raw_vec = features.flatten()
         else:
@@ -260,16 +402,39 @@ class AttackClassifier:
         sanitized_vec = np.nan_to_num(raw_vec, nan=0.0, posinf=1.0, neginf=0.0).astype(np.float32)
         input_2d = sanitized_vec.reshape(1, -1)
 
-        # Ensure compatibility with pre-trained models expecting 13 features
-        expected_features = 13
+        # Extract contextual spatial/compression features
+        if max_grid_norm_ratio is None:
+            resolved_norm_ratio = float(sanitized_vec[13]) if len(sanitized_vec) > 13 else 1.0
+        else:
+            resolved_norm_ratio = float(max_grid_norm_ratio)
+
+        if jpeg_recompression_delta is None:
+            resolved_jpeg_delta = float(sanitized_vec[14]) if len(sanitized_vec) > 14 else 1.0
+        else:
+            resolved_jpeg_delta = float(jpeg_recompression_delta)
+
+        # Model feature dimension alignment
+        expected_features = 15
         if self.is_onnx:
             in_shape = self.model.get_inputs()[0].shape
             if len(in_shape) > 1 and isinstance(in_shape[1], int):
                 expected_features = in_shape[1]
         elif hasattr(self.model, "n_features_in_"):
             expected_features = self.model.n_features_in_
+        elif hasattr(self.model, "calibrated_classifiers_"):
+            first_est = getattr(self.model.calibrated_classifiers_[0], "estimator", self.model.calibrated_classifiers_[0])
+            if hasattr(first_est, "n_features_in_"):
+                expected_features = first_est.n_features_in_
 
-        model_input = input_2d[:, :expected_features] if input_2d.shape[1] >= expected_features else input_2d
+        if input_2d.shape[1] < expected_features:
+            padded = np.zeros((1, expected_features), dtype=np.float32)
+            padded[0, :input_2d.shape[1]] = input_2d[0]
+            if expected_features >= 15 and input_2d.shape[1] == 13:
+                padded[0, 13] = resolved_norm_ratio
+                padded[0, 14] = resolved_jpeg_delta
+            model_input = padded
+        else:
+            model_input = input_2d[:, :expected_features]
 
         # 2. Forward model inference
         if self.is_onnx:
@@ -299,52 +464,111 @@ class AttackClassifier:
 
         t_elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 
-        # Extract contextual causal verification attributes
-        if conf_drop is None:
-            resolved_conf_drop = float(sanitized_vec[1]) if len(sanitized_vec) > 1 else 0.0
-        else:
-            resolved_conf_drop = float(conf_drop)
-
-        if max_grid_norm_ratio is None:
-            resolved_norm_ratio = float(sanitized_vec[13]) if len(sanitized_vec) > 13 else 1.0
-        else:
-            resolved_norm_ratio = float(max_grid_norm_ratio)
-
-        has_conf_drop = bool(resolved_conf_drop >= 0.10)
-
         resolved_recovered_count = int(recovered_objects_count)
         if resolved_recovered_count == 0 and resolved_delta_p_obj >= 0.15:
             resolved_recovered_count = 1
 
-        patch_in_person = self._check_patch_in_person(all_patch_rois, resolved_person_bbox)
-
-        # 3. Two-Stage Causal Verification Gate
-        # (a) Local Thys Attack Gate: The candidate patch ROI overlaps/lies inside a detected person bounding box
-        #     AND (delta_p_obj >= 0.15 after Pass 2 inpainting OR classifier_prob >= 0.85 with a drop in tracked person confidence).
-        local_thys_gate = bool(
-            patch_in_person and (
-                resolved_delta_p_obj >= 0.15 or (p_attack >= 0.85 and has_conf_drop)
-            )
-        )
-
-        # (b) Global DPATCH Gate: The candidate patch ROI exhibits max_grid_norm_ratio > 3.5
-        #     AND Pass 2 inpainting recovers >= 1 previously suppressed objects anywhere in the frame.
-        global_dpatch_gate = bool(
-            resolved_norm_ratio > 3.5 and resolved_recovered_count >= 1
-        )
-
-        causal_gate_passed = bool(local_thys_gate or global_dpatch_gate)
-
-        # An alert MUST NOT be flagged as is_attack = True based solely on classifier texture/gradient features
-        # if delta_p_obj is near zero.
-        # Confirm an adversarial attack (is_attack = True) only if the causal gate passes:
-        is_attack = bool(
-            (p_attack >= self.threshold or resolved_delta_p_obj >= 0.15)
-            and causal_gate_passed
-        )
-
-        # 4. Explainability & Feature Contribution Attribution
         top_contributors = self._compute_feature_contributions(sanitized_vec)
+
+        # ====================================================================
+        # 3. Two-Stage Causal Verification Gate
+        # ====================================================================
+
+        # Rule 1: Never flag is_attack = True on any non-person object (class_name != 'person')
+        if resolved_class_name.strip().lower() != "person":
+            return AttackPrediction(
+                is_attack=False,
+                attack_probability=round(p_attack, 4),
+                confidence_clean=round(p_clean, 4),
+                feature_importances=self.global_importances,
+                top_contributing_features=top_contributors,
+                inference_latency_ms=round(t_elapsed_ms, 4),
+                causal_verification_passed=False,
+                delta_p_obj=round(resolved_delta_p_obj, 4),
+                case_triggered=None,
+                patch_conf=round(resolved_patch_conf, 4),
+            )
+
+        # Rule 2: Never flag is_attack = True on any person box where is_near_frame_edge is True
+        if is_near_frame_edge is not None:
+            near_edge = bool(is_near_frame_edge)
+        elif resolved_person_bbox is not None:
+            near_edge = check_is_near_frame_edge(resolved_person_bbox, frame_shape, margin=0.05)
+        else:
+            near_edge = False
+
+        if near_edge:
+            return AttackPrediction(
+                is_attack=False,
+                attack_probability=round(p_attack, 4),
+                confidence_clean=round(p_clean, 4),
+                feature_importances=self.global_importances,
+                top_contributing_features=top_contributors,
+                inference_latency_ms=round(t_elapsed_ms, 4),
+                causal_verification_passed=False,
+                delta_p_obj=round(resolved_delta_p_obj, 4),
+                case_triggered=None,
+                patch_conf=round(resolved_patch_conf, 4),
+            )
+
+        # Rule 3: For an interior person detection, set is_attack = True ONLY if a valid patch_roi
+        # satisfies is_inside_torso AND meets at least one of these three conditions:
+        # Case A: delta_p_obj >= 0.15 after Pass 2 Telea inpainting
+        # Case B: patch_roi detected by models/ad_yolo_best.pt (patch_conf >= 0.45) AND (delta_p_obj >= 0.05 OR classifier_prob >= 0.65)
+        # Case C: classifier_prob >= 0.82 AND (jpeg_recompression_delta / max_grid_norm_ratio) exceed clean clothing thresholds
+        if resolved_person_bbox is not None and all_patch_rois:
+            valid_torso_patches = [
+                roi for roi in all_patch_rois
+                if check_is_inside_torso(roi, resolved_person_bbox)
+            ]
+            has_valid_torso_patch = len(valid_torso_patches) > 0
+        elif resolved_person_bbox is None and not all_patch_rois:
+            # Fallback when evaluated solely on 1D feature vectors (e.g. unit tests / benchmarks)
+            has_valid_torso_patch = True
+        else:
+            # Either person bbox is given without candidate patches, or patch ROIs are given without a person (background candidate)
+            has_valid_torso_patch = False
+
+        case_a = bool(resolved_delta_p_obj >= 0.15)
+        case_b = bool(resolved_patch_conf >= 0.45 and (resolved_delta_p_obj >= 0.05 or p_attack >= 0.65))
+        clean_clothing_threshold_exceeded = bool(
+            resolved_norm_ratio > CLEAN_CLOTHING_MAX_GRID_NORM_RATIO
+            or resolved_jpeg_delta > CLEAN_CLOTHING_JPEG_DELTA
+        )
+        case_c = bool(p_attack >= 0.82 and clean_clothing_threshold_exceeded)
+
+        local_torso_gate = bool(has_valid_torso_patch and (case_a or case_b or case_c))
+
+        # Rule 4: Disable global background DPATCH alerts on live streams unless
+        # max_grid_norm_ratio > 5.0 inside the central 85% of the frame
+        # AND Pass 2 recovers >= 1 suppressed object with delta_p_obj > 0.35.
+        if all_patch_rois:
+            in_central_85 = any(is_in_central_frame(roi, frame_shape, 0.85) for roi in all_patch_rois)
+        elif resolved_person_bbox is not None:
+            in_central_85 = is_in_central_frame(resolved_person_bbox, frame_shape, 0.85)
+        else:
+            in_central_85 = True
+
+        global_dpatch_gate = bool(
+            resolved_norm_ratio > 5.0
+            and in_central_85
+            and resolved_recovered_count >= 1
+            and resolved_delta_p_obj > 0.35
+        )
+
+        causal_gate_passed = bool(local_torso_gate or global_dpatch_gate)
+        is_attack = causal_gate_passed
+
+        case_triggered: Optional[str] = None
+        if local_torso_gate:
+            if case_a:
+                case_triggered = "Case A (Causal Objectness Recovery)"
+            elif case_b:
+                case_triggered = "Case B (Fine-Tuned Ad-YOLO Match)"
+            elif case_c:
+                case_triggered = "Case C (High-Confidence Zero-Shot Anomaly)"
+        elif global_dpatch_gate:
+            case_triggered = "Global DPATCH Gate"
 
         return AttackPrediction(
             is_attack=is_attack,
@@ -355,6 +579,8 @@ class AttackClassifier:
             inference_latency_ms=round(t_elapsed_ms, 4),
             causal_verification_passed=causal_gate_passed,
             delta_p_obj=round(resolved_delta_p_obj, 4),
+            case_triggered=case_triggered,
+            patch_conf=round(resolved_patch_conf, 4),
         )
 
     def _compute_feature_contributions(self, feature_vec: np.ndarray) -> List[Tuple[str, float]]:
@@ -397,6 +623,8 @@ class AttackClassifier:
         patch_rois_list: Optional[Sequence[Optional[Sequence[Sequence[float]]]]] = None,
         person_bboxes: Optional[Sequence[Optional[Sequence[float]]]] = None,
         recovered_counts: Optional[Sequence[int]] = None,
+        class_names: Optional[Sequence[str]] = None,
+        patch_confs: Optional[Sequence[float]] = None,
     ) -> List[AttackPrediction]:
         """Perform batch prediction across multiple tracks with optional causal context."""
         results = []
@@ -407,6 +635,8 @@ class AttackClassifier:
             p_rois = patch_rois_list[i] if patch_rois_list is not None and i < len(patch_rois_list) else None
             p_box = person_bboxes[i] if person_bboxes is not None and i < len(person_bboxes) else None
             rec_cnt = recovered_counts[i] if recovered_counts is not None and i < len(recovered_counts) else 0
+            c_name = class_names[i] if class_names is not None and i < len(class_names) else "person"
+            p_conf = patch_confs[i] if patch_confs is not None and i < len(patch_confs) else 0.0
             results.append(
                 self.predict(
                     vec,
@@ -414,6 +644,8 @@ class AttackClassifier:
                     patch_rois=p_rois,
                     person_bbox=p_box,
                     recovered_objects_count=rec_cnt,
+                    class_name=c_name,
+                    patch_conf=p_conf,
                 )
             )
         return results

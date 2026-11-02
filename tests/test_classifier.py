@@ -29,15 +29,19 @@ from src.detection.feature_extractor import FEATURE_NAMES, FeaturePacket
 @pytest.fixture
 def clean_feature_vector() -> np.ndarray:
     """Simulates a feature vector of a normal, unperturbed tracked human."""
-    # Matches FEATURE_NAMES:
+    # Matches FEATURE_NAMES (15 features):
     # 0: conf_current (0.94), 1: conf_drop (0.01), 2: conf_std (0.02),
     # 3: area_stability (0.02), 4: aspect_ratio_stability (0.02),
     # 5: mean_consecutive_iou (0.95), 6: min_consecutive_iou (0.90),
     # 7: flicker_rate (0.0), 8: laplacian_var_norm (0.15),
     # 9: laplacian_entropy (0.20), 10: color_hue_entropy (0.20),
-    # 11: color_sat_entropy (0.20), 12: color_val_entropy (0.30)
+    # 11: color_sat_entropy (0.20), 12: color_val_entropy (0.30),
+    # 13: max_grid_norm_ratio (1.4), 14: jpeg_recompression_delta (1.0)
     return np.array(
-        [0.94, 0.01, 0.02, 0.02, 0.02, 0.95, 0.90, 0.0, 0.15, 0.20, 0.20, 0.20, 0.30],
+        [
+            0.94, 0.01, 0.02, 0.02, 0.02, 0.95, 0.90, 0.0,
+            0.15, 0.20, 0.20, 0.20, 0.30, 1.4, 1.0,
+        ],
         dtype=np.float32,
     )
 
@@ -45,9 +49,13 @@ def clean_feature_vector() -> np.ndarray:
 @pytest.fixture
 def attacked_feature_vector() -> np.ndarray:
     """Simulates a feature vector under active adversarial optical patch attack."""
-    # Severe confidence drop, erratic area stability, high flicker, high gradient/color entropy
+    # Severe confidence drop, erratic area stability, high flicker, high gradient/color entropy,
+    # and elevated grid norm ratio / jpeg recompression delta
     return np.array(
-        [0.22, 0.72, 0.35, 0.55, 0.45, 0.40, 0.15, 0.30, 0.85, 0.90, 0.88, 0.82, 0.78],
+        [
+            0.22, 0.72, 0.35, 0.55, 0.45, 0.40, 0.15, 0.30,
+            0.85, 0.90, 0.88, 0.82, 0.78, 2.6, 2.4,
+        ],
         dtype=np.float32,
     )
 
@@ -134,7 +142,7 @@ class TestAttackClassifierAccuracyAndAlerts:
             track_id=1,
             bbox=np.array([100, 100, 200, 300]),
             feature_vector=clean_feature_vector,
-            feature_dict={FEATURE_NAMES[i]: float(clean_feature_vector[i]) for i in range(13)},
+            feature_dict={FEATURE_NAMES[i]: float(clean_feature_vector[i]) for i in range(len(clean_feature_vector))},
         )
         pred_packet = classifier.predict(packet)
         assert isinstance(pred_packet, AttackPrediction)
@@ -237,6 +245,188 @@ class TestAttackClassifierAccuracyAndAlerts:
         )
         assert pred_attack.causal_verification_passed is True
         assert pred_attack.delta_p_obj == 0.35
+
+    def test_benign_striped_and_checkered_clothing(self, classifier):
+        """Verifies that benign striped and checkered clothing with delta_p_obj = 0.0 and patch_conf = 0.0
+        is NEVER flagged as an attack (is_attack = False).
+        """
+        person_bbox = [100.0, 100.0, 260.0, 480.0]
+        torso_patch_roi = [135.0, 160.0, 225.0, 260.0]
+
+        # 1. Benign striped clothing vector (high texture gradients, zero recovery delta, zero patch conf)
+        striped_vec = np.array(
+            [
+                0.93, 0.01, 0.02, 0.03, 0.02, 0.94, 0.88, 0.0,
+                0.88, 0.91, 0.75, 0.70, 0.72, 1.6, 1.2,
+            ],
+            dtype=np.float32,
+        )
+        pred_striped = classifier.predict(
+            striped_vec,
+            delta_p_obj=0.0,
+            patch_conf=0.0,
+            patch_roi=torso_patch_roi,
+            person_bbox=person_bbox,
+        )
+        assert pred_striped.is_attack is False
+        assert pred_striped.causal_verification_passed is False
+
+        # 2. Benign checkered clothing vector
+        checkered_vec = np.array(
+            [
+                0.91, 0.01, 0.02, 0.02, 0.02, 0.95, 0.89, 0.0,
+                0.90, 0.93, 0.84, 0.82, 0.80, 1.7, 1.3,
+            ],
+            dtype=np.float32,
+        )
+        pred_checkered = classifier.predict(
+            checkered_vec,
+            delta_p_obj=0.0,
+            patch_conf=0.0,
+            patch_roi=torso_patch_roi,
+            person_bbox=person_bbox,
+        )
+        assert pred_checkered.is_attack is False
+        assert pred_checkered.causal_verification_passed is False
+
+    def test_frame_edge_person_guard(self, classifier):
+        """Verifies that any person box touching or near the frame edge (e.g. x1 = 2)
+        is NEVER flagged as an attack (is_attack = False), even if delta_p_obj is high.
+        """
+        # Frame edge person: x1 = 2 touches left margin (2 <= 0.05 * 640 = 32)
+        edge_person_bbox = [2.0, 100.0, 160.0, 450.0]
+        torso_patch_roi = [20.0, 160.0, 120.0, 260.0]
+
+        suspicious_vec = np.array(
+            [
+                0.35, 0.60, 0.30, 0.40, 0.35, 0.50, 0.25, 0.20,
+                0.80, 0.85, 0.80, 0.75, 0.75, 2.4, 2.5,
+            ],
+            dtype=np.float32,
+        )
+
+        pred_edge = classifier.predict(
+            suspicious_vec,
+            delta_p_obj=0.25,
+            patch_roi=torso_patch_roi,
+            person_bbox=edge_person_bbox,
+            frame_shape=(640, 640),
+        )
+        assert pred_edge.is_attack is False, (
+            f"Frame-edge person with x1=2 must NOT be flagged as an attack! Got: {pred_edge}"
+        )
+        assert pred_edge.causal_verification_passed is False
+
+    def test_interior_person_with_torso_patch(self, classifier):
+        """Verifies that an interior person with a torso patch is flagged as is_attack = True
+        when delta_p_obj = 0.30 (Case A) or patch_conf = 0.75 (Case B).
+        """
+        interior_person_bbox = [100.0, 100.0, 260.0, 480.0]
+        torso_patch_roi = [135.0, 160.0, 225.0, 260.0]
+
+        attack_vec = np.array(
+            [
+                0.24, 0.70, 0.35, 0.45, 0.40, 0.45, 0.20, 0.25,
+                0.85, 0.90, 0.85, 0.80, 0.80, 2.5, 2.8,
+            ],
+            dtype=np.float32,
+        )
+
+        # Subcase 1: Case A (Causal Objectness Recovery delta_p_obj = 0.30 >= 0.15)
+        pred_case_a = classifier.predict(
+            attack_vec,
+            delta_p_obj=0.30,
+            patch_roi=torso_patch_roi,
+            person_bbox=interior_person_bbox,
+        )
+        assert pred_case_a.is_attack is True, f"Expected is_attack=True for delta_p_obj=0.30, got {pred_case_a}"
+        assert pred_case_a.causal_verification_passed is True
+        assert pred_case_a.delta_p_obj == 0.30
+
+        # Subcase 2: Case B (Fine-Tuned Ad-YOLO Match patch_conf = 0.75 >= 0.45 with classifier_prob >= 0.65)
+        pred_case_b = classifier.predict(
+            attack_vec,
+            delta_p_obj=0.05,
+            patch_conf=0.75,
+            patch_roi=torso_patch_roi,
+            person_bbox=interior_person_bbox,
+        )
+        assert pred_case_b.is_attack is True, f"Expected is_attack=True for patch_conf=0.75, got {pred_case_b}"
+        assert pred_case_b.causal_verification_passed is True
+        assert pred_case_b.patch_conf == 0.75
+
+    def test_non_person_object_never_flagged(self, classifier):
+        """Verifies that non-person objects (class_name != 'person') are NEVER flagged as attack."""
+        person_bbox = [100.0, 100.0, 260.0, 480.0]
+        torso_patch_roi = [135.0, 160.0, 225.0, 260.0]
+
+        attack_vec = np.array(
+            [
+                0.24, 0.70, 0.35, 0.45, 0.40, 0.45, 0.20, 0.25,
+                0.85, 0.90, 0.85, 0.80, 0.80, 2.5, 2.8,
+            ],
+            dtype=np.float32,
+        )
+
+        pred_car = classifier.predict(
+            attack_vec,
+            delta_p_obj=0.35,
+            patch_roi=torso_patch_roi,
+            person_bbox=person_bbox,
+            class_name="car",
+        )
+        assert pred_car.is_attack is False
+        assert pred_car.causal_verification_passed is False
+
+    def test_global_dpatch_stream_gate(self, classifier):
+        """Verifies that live stream global DPATCH alerts are disabled unless:
+        max_grid_norm_ratio > 5.0 inside central 85% of frame
+        AND Pass 2 inpainting recovers >= 1 suppressed object with delta_p_obj > 0.35.
+        """
+        # Corner DPATCH (outside central 85%): x1=10, y1=10
+        corner_dpatch = [10.0, 10.0, 40.0, 40.0]
+        vec = np.array(
+            [
+                0.30, 0.50, 0.30, 0.40, 0.30, 0.50, 0.20, 0.20,
+                0.85, 0.90, 0.85, 0.80, 0.80, 6.0, 3.5,
+            ],
+            dtype=np.float32,
+        )
+
+        # 1. Corner patch fails central 85% requirement -> False
+        pred_corner = classifier.predict(
+            vec,
+            max_grid_norm_ratio=6.0,
+            delta_p_obj=0.40,
+            recovered_objects_count=1,
+            patch_roi=corner_dpatch,
+            frame_shape=(640, 640),
+        )
+        assert pred_corner.is_attack is False
+
+        # 2. Central patch (inside central 85%) but ratio <= 5.0 -> False
+        central_dpatch = [250.0, 250.0, 320.0, 320.0]
+        pred_low_ratio = classifier.predict(
+            vec,
+            max_grid_norm_ratio=4.5,
+            delta_p_obj=0.40,
+            recovered_objects_count=1,
+            patch_roi=central_dpatch,
+            frame_shape=(640, 640),
+        )
+        assert pred_low_ratio.is_attack is False
+
+        # 3. Central patch with ratio > 5.0 AND delta_p_obj > 0.35 AND recovered >= 1 -> True
+        pred_dpatch_attack = classifier.predict(
+            vec,
+            max_grid_norm_ratio=5.5,
+            delta_p_obj=0.40,
+            recovered_objects_count=1,
+            patch_roi=central_dpatch,
+            frame_shape=(640, 640),
+        )
+        assert pred_dpatch_attack.is_attack is True
+        assert pred_dpatch_attack.causal_verification_passed is True
 
     def test_hard_negative_patch_applier(self):
         """Test HardNegativePatchApplier pattern generation and EOT augmentation."""

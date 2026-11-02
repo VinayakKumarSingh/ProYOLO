@@ -34,7 +34,7 @@ WORKSPACE_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 if WORKSPACE_ROOT not in sys.path:
     sys.path.insert(0, WORKSPACE_ROOT)
 
-from src.classifier.attack_classifier import AttackClassifier, AttackPrediction
+from src.classifier.attack_classifier import AttackClassifier, AttackPrediction, check_is_near_frame_edge
 from src.detection.detector import Detection, YOLOv8ONNXDetector
 from src.detection.feature_extractor import DualFeatureExtractor
 from src.detection.tracker import ByteTracker, Track
@@ -92,9 +92,21 @@ class StreamEngine:
             self.detector = YOLOv8ONNXDetector(model_p, input_size=(384, 384), conf_threshold=0.35)
 
         # Initialize tracker & defense models
-        self.tracker = tracker if tracker is not None else ByteTracker(track_thresh=0.40, match_thresh=0.7)
+        self.tracker = tracker if tracker is not None else ByteTracker(track_thresh=0.40, low_thresh=0.15, match_thresh=0.7)
         self.feature_extractor = feature_extractor if feature_extractor is not None else DualFeatureExtractor()
         self.classifier = classifier if classifier is not None else AttackClassifier(model_path=classifier_path, threshold=threshold)
+
+        # Log whether models/ad_yolo_best.pt is loaded at startup
+        ad_yolo_p = Path(WORKSPACE_ROOT) / "models" / "ad_yolo_best.pt"
+        is_ad_yolo_loaded = (
+            (hasattr(self.detector, "patch_model") and self.detector.patch_model is not None)
+            or (hasattr(self.classifier, "patch_model") and self.classifier.patch_model is not None)
+        )
+        logger.info(
+            "Ad-YOLO model status at startup: %s (models/ad_yolo_best.pt exists=%s)",
+            "LOADED" if is_ad_yolo_loaded else "NOT LOADED",
+            ad_yolo_p.exists(),
+        )
 
         # Open initial capture source
         self._open_capture(source)
@@ -137,7 +149,7 @@ class StreamEngine:
         logger.info("Switching stream engine source to: %s (loop=%s)", source, loop)
         self.is_looping = loop
         self.is_paused = False
-        self.tracker = ByteTracker(track_thresh=0.40, match_thresh=0.7)
+        self.tracker = ByteTracker(track_thresh=0.40, low_thresh=0.15, match_thresh=0.7)
         self._open_capture(source)
 
     def set_paused(self, paused: bool) -> None:
@@ -219,32 +231,60 @@ class StreamEngine:
 
         # 1. Object Detection with Active Two-Pass Inpainting Recovery
         if hasattr(self.detector, "detect_with_recovery"):
-            detections = self.detector.detect_with_recovery(frame, conf_thresh=0.40, low_conf_thresh=0.12)
+            detections = self.detector.detect_with_recovery(frame, conf_thresh=0.40, low_conf_thresh=0.15)
         else:
             detections = self.detector.detect(frame)
-        person_detections = [d for d in detections if d.class_id == 0]
 
-        # 2. Multi-Object Tracking (ByteTrack with dual-threshold association)
-        active_tracks = self.tracker.update(person_detections)
+        # 2. Multi-Object Tracking across all 80 classes (ByteTrack with dual-threshold association)
+        active_tracks = self.tracker.update(detections)
 
         telemetry_items: List[Dict[str, Any]] = []
 
         for track in active_tracks:
-            feat_packet = self.feature_extractor.extract_single(frame, track)
-            prediction: AttackPrediction = self.classifier.predict(feat_packet)
-
-            is_threat = prediction.is_attack
-            # Enforce temporal persistence: K=3 out of N=5 consecutive frames
-            confirmed_alert = track.record_attack_prediction(is_threat)
-            prob = float(prediction.attack_probability)
+            is_person = (str(track.class_name).lower() == "person" or track.class_id == 0)
+            delta_p_obj = float(getattr(track, "delta_p_obj", 0.0))
+            recovered_by_inpainting = bool(getattr(track, "recovered_by_inpainting", False))
+            patch_roi = getattr(track, "patch_roi", None)
             conf = float(track.latest_confidence)
             bbox = [float(v) for v in track.latest_bbox]
-            recovered_by_inpainting = bool(getattr(track, "recovered_by_inpainting", False))
-            delta_p_obj = float(getattr(track, "delta_p_obj", 0.0))
+            is_near_edge = check_is_near_frame_edge(track.latest_bbox, frame_shape=(h_img, w_img), margin=0.05)
+
+            if is_person:
+                feat_packet = self.feature_extractor.extract_single(frame, track)
+                prediction: AttackPrediction = self.classifier.predict(
+                    feat_packet,
+                    class_name=track.class_name,
+                    person_bbox=track.latest_bbox,
+                    frame_shape=(h_img, w_img),
+                    delta_p_obj=delta_p_obj,
+                    patch_roi=patch_roi,
+                )
+                is_threat = bool(prediction.is_attack)
+                prob = float(prediction.attack_probability)
+                top_features = dict(prediction.top_contributing_features)
+                # Enforce temporal persistence: K=4 out of N=5 consecutive frames on interior persons
+                confirmed_alert = track.record_attack_prediction(
+                    is_threat,
+                    is_near_edge=is_near_edge,
+                    frame_shape=(h_img, w_img),
+                )
+            else:
+                is_threat = False
+                prob = 0.0
+                top_features = {}
+                confirmed_alert = track.record_attack_prediction(
+                    False,
+                    is_near_edge=is_near_edge,
+                    frame_shape=(h_img, w_img),
+                )
+
+            label_text = "PERSON (UNDER ATTACK)" if confirmed_alert else f"{track.class_name} {conf:.2f}"
 
             item = {
                 "track_id": track.track_id,
-                "label": "Attacker" if confirmed_alert else ("Suspect" if is_threat else "Person"),
+                "class_id": track.class_id,
+                "class_name": track.class_name,
+                "label": label_text,
                 "bbox": bbox,
                 "confidence": round(conf, 3),
                 "is_attack": is_threat,
@@ -252,22 +292,25 @@ class StreamEngine:
                 "attack_probability": round(prob, 3),
                 "recovered_by_inpainting": recovered_by_inpainting,
                 "delta_p_obj": round(delta_p_obj, 3),
+                "patch_roi": list(patch_roi) if patch_roi is not None else None,
             }
             telemetry_items.append(item)
 
-            # Draw Real Annotations (Person / Attacker / Inpainting Recovered)
+            # Draw Real Annotations (Standard green/blue for non-attack, Red + Patch box for confirmed attack)
             self._draw_detection_box(
                 display_frame,
                 track.track_id,
                 bbox,
                 conf,
-                confirmed_alert,
-                prob,
+                confirmed_attack_alert=confirmed_alert,
+                prob=prob,
                 recovered_by_inpainting=recovered_by_inpainting,
                 delta_p_obj=delta_p_obj,
+                class_name=track.class_name,
+                patch_roi=patch_roi,
             )
 
-            # Only fire alerts when confirmed by temporal persistence (K=3 / N=5)
+            # Only log alerts to SQLite and publish to Redis when confirmed_attack_alert == True
             if confirmed_alert:
                 self.total_attacks_flagged += 1
 
@@ -283,25 +326,28 @@ class StreamEngine:
                 alert_data = {
                     "camera_id": self.camera_id,
                     "track_id": track.track_id,
-                    "classification": "Attacker",
+                    "class_name": track.class_name,
+                    "classification": "PERSON (UNDER ATTACK)",
                     "confidence": round(conf, 4),
                     "attack_probability": round(prob, 4),
                     "bbox": [round(float(v), 2) for v in bbox],
                     "timestamp": timestamp,
                     "thumbnail_b64": thumb_b64,
-                    "top_features": dict(prediction.top_contributing_features),
+                    "top_features": top_features,
                     "confirmed_attack_alert": True,
                     "recovered_by_inpainting": recovered_by_inpainting,
                     "delta_p_obj": round(delta_p_obj, 4),
+                    "patch_roi": [round(float(v), 2) for v in patch_roi] if patch_roi is not None else None,
                 }
 
-                # Publish to Redis Manager if configured
+                # Publish to Redis Manager ONLY when confirmed_attack_alert == True
                 if hasattr(self, "redis_manager") and self.redis_manager is not None:
                     try:
                         self.redis_manager.publish_alert(alert_data)
                     except Exception as exc:
                         logger.debug("Redis alert publish error: %s", exc)
 
+                # Save to database and broadcast ONLY when confirmed_attack_alert == True
                 if self.alert_callback:
                     try:
                         res = self.alert_callback(alert_data)
@@ -355,59 +401,128 @@ class StreamEngine:
         track_id: int,
         bbox: List[float],
         conf: float,
-        is_attack: bool,
-        prob: float,
+        confirmed_attack_alert: bool = False,
+        prob: float = 0.0,
         recovered_by_inpainting: bool = False,
         delta_p_obj: float = 0.0,
+        class_name: str = "person",
+        patch_roi: Optional[Sequence[float]] = None,
+        is_attack: Optional[bool] = None,
     ) -> None:
-        """Render annotated bounding boxes and threat labels on display frame."""
-        x1, y1, x2, y2 = [int(v) for v in bbox]
+        """Render annotated bounding boxes and threat labels on display frame.
 
-        if is_attack:
-            color = (95, 42, 255)  # Crimson Red in BGR
-            thick = 3
-            label = f"Attacker #{track_id} ({prob * 100:.0f}%)"
-            badge_color = (95, 42, 255)
-        elif recovered_by_inpainting:
-            color = (212, 182, 6)  # Cyan/Teal in BGR for Inpainting Recovered
-            thick = 2
-            label = f"Recovered #{track_id} ({conf * 100:.0f}% ΔP={delta_p_obj:+.2f})"
-            badge_color = (212, 182, 6)
+        - If confirmed_attack_alert is False: Render bounding box in standard green/blue with its
+          native YOLO class name and confidence (e.g. 'person 0.89', 'cell phone 0.78'). Never display 'Attacker'.
+        - If confirmed_attack_alert is True: Render person bounding box in red labeled 'PERSON (UNDER ATTACK)'
+          and render a second distinct orange/magenta box around patch_roi inside torso labeled 'ADVERSARIAL PATCH (ΔP=...)'.
+        """
+        # Support positional backward compatibility if is_attack passed as 5th argument
+        if is_attack is not None and not confirmed_attack_alert:
+            confirmed_alert = is_attack
         else:
-            color = (129, 185, 16)  # Emerald Green in BGR
-            thick = 2
-            label = f"Person #{track_id} ({conf * 100:.0f}%)"
-            badge_color = (129, 185, 16)
+            confirmed_alert = bool(confirmed_attack_alert)
 
-        # Draw Main Box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        h_img, w_img = frame.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        if confirmed_alert:
+            color = (42, 42, 235)  # Crimson Red in BGR
+            thick = 3
+            label = "PERSON (UNDER ATTACK)"
+            badge_color = (42, 42, 235)
+
+            # Draw Main Person Box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
+
+            # Label Banner
+            font_scale = 0.5
+            (tw, th), _ = cv2.getTextSize(label, font, font_scale, 2)
+            cv2.rectangle(frame, (x1, max(0, y1 - 24)), (x1 + tw + 10, y1), badge_color, -1)
+            cv2.putText(
+                frame,
+                label,
+                (x1 + 5, max(16, y1 - 6)),
+                font,
+                font_scale,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+            # Render distinct second orange/magenta box around patch_roi inside torso
+            patch_color = (0, 140, 255)  # Orange in BGR
+            if patch_roi is not None and len(patch_roi) >= 4:
+                px1, py1, px2, py2 = [int(v) for v in patch_roi[:4]]
+                px1 = max(x1, min(w_img - 1, px1))
+                py1 = max(y1, min(h_img - 1, py1))
+                px2 = max(px1 + 5, min(x2, px2))
+                py2 = max(py1 + 5, min(y2, py2))
+            else:
+                bw = max(10, x2 - x1)
+                bh = max(10, y2 - y1)
+                px1 = int(x1 + 0.25 * bw)
+                px2 = int(x1 + 0.75 * bw)
+                py1 = int(y1 + 0.20 * bh)
+                py2 = int(y1 + 0.55 * bh)
+
+            cv2.rectangle(frame, (px1, py1), (px2, py2), patch_color, 2)
+            patch_label = f"ADVERSARIAL PATCH (\u0394P={delta_p_obj:.2f})"
+            patch_scale = 0.42
+            (ptw, pth), _ = cv2.getTextSize(patch_label, font, patch_scale, 1)
+            cv2.rectangle(frame, (px1, max(0, py1 - 18)), (px1 + ptw + 8, py1), patch_color, -1)
+            cv2.putText(
+                frame,
+                patch_label,
+                (px1 + 4, max(13, py1 - 4)),
+                font,
+                patch_scale,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+        else:
+            # Clean standard green/blue rendering with native YOLO class name and confidence
+            if recovered_by_inpainting:
+                color = (212, 182, 6)  # Cyan/Blue in BGR
+                badge_color = (212, 182, 6)
+            else:
+                color = (129, 185, 16)  # Emerald Green in BGR
+                badge_color = (129, 185, 16)
+
+            thick = 2
+            label = f"{class_name} {conf:.2f}"
+
+            # Draw Main Box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
+
+            # Label Banner
+            font_scale = 0.45
+            (tw, th), _ = cv2.getTextSize(label, font, font_scale, 1)
+            cv2.rectangle(frame, (x1, max(0, y1 - 22)), (x1 + tw + 10, y1), badge_color, -1)
+            cv2.putText(
+                frame,
+                label,
+                (x1 + 5, max(15, y1 - 6)),
+                font,
+                font_scale,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
         # Corner Brackets
-        c_len = 12
-        cv2.line(frame, (x1, y1), (x1 + c_len, y1), color, thick + 1)
-        cv2.line(frame, (x1, y1), (x1, y1 + c_len), color, thick + 1)
-        cv2.line(frame, (x2, y1), (x2 - c_len, y1), color, thick + 1)
-        cv2.line(frame, (x2, y1), (x2, y1 + c_len), color, thick + 1)
-        cv2.line(frame, (x1, y2), (x1 + c_len, y2), color, thick + 1)
-        cv2.line(frame, (x1, y2), (x1, y2 - c_len), color, thick + 1)
-        cv2.line(frame, (x2, y2), (x2 - c_len, y2), color, thick + 1)
-        cv2.line(frame, (x2, y2), (x2, y2 - c_len), color, thick + 1)
-
-        # Label Banner
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.45
-        (tw, th), _ = cv2.getTextSize(label, font, font_scale, 1)
-        cv2.rectangle(frame, (x1, max(0, y1 - 22)), (x1 + tw + 10, y1), badge_color, -1)
-        cv2.putText(
-            frame,
-            label,
-            (x1 + 5, max(15, y1 - 6)),
-            font,
-            font_scale,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
+        c_len = 10
+        corner_color = color
+        cv2.line(frame, (x1, y1), (x1 + c_len, y1), corner_color, thick + 1)
+        cv2.line(frame, (x1, y1), (x1, y1 + c_len), corner_color, thick + 1)
+        cv2.line(frame, (x2, y1), (x2 - c_len, y1), corner_color, thick + 1)
+        cv2.line(frame, (x2, y1), (x2, y1 + c_len), corner_color, thick + 1)
+        cv2.line(frame, (x1, y2), (x1 + c_len, y2), corner_color, thick + 1)
+        cv2.line(frame, (x1, y2), (x1, y2 - c_len), corner_color, thick + 1)
+        cv2.line(frame, (x2, y2), (x2 - c_len, y2), corner_color, thick + 1)
+        cv2.line(frame, (x2, y2), (x2, y2 - c_len), corner_color, thick + 1)
 
     def _draw_osd_hud(
         self,

@@ -308,8 +308,8 @@ class TestRobustnessBenchmark:
         assert 0.0 <= report.clean_fpr <= 0.05
         assert report.clean_person_recall >= 0.85
 
-        # Scenario 2 (Hard-Negative Benign Clothing): FPR strictly < 2%
-        assert report.hard_negative_fpr < 0.02
+        # Scenario 2 (Hard-Negative Benign Clothing & Frame Edges): FPR strictly < 1%
+        assert report.hard_negative_fpr < 0.01
 
         # Scenario 3 (Local Thys et al. Torso Patch Attack): Pass 2 recovered recall > Pass 1 raw attack recall
         assert report.pass1_attack_recall < report.pass2_recovered_recall
@@ -326,7 +326,7 @@ class TestRobustnessBenchmark:
         assert md_file.exists()
 
         csv_text = csv_file.read_text(encoding="utf-8")
-        assert "Scenario 1: Clean Baseline" in csv_text
+        assert "Scenario 1: Clean Multi-Class Baseline" in csv_text
         assert "Scenario 2: Hard-Negative Benign Clothing" in csv_text
         assert "Scenario 3: Local Thys et al. Torso Patch Attack" in csv_text
         assert "Scenario 4: Global DPATCH Attack" in csv_text

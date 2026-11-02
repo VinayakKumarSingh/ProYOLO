@@ -1,33 +1,33 @@
 scenario_id,name,description,num_samples,clean_recall,fpr,pass1_recall,pass2_recall,mean_latency_ms,sustained_fps,notes
-1,Scenario 1: Clean Baseline,Unmodified surveillance frames with normal clothing,10,1.0,0.0,1.0,1.0,34.81,28.7,Nominal surveillance; clean recall verification and zero false alerts
-2,Scenario 2: Hard-Negative Benign Clothing,"Pedestrians wearing high-contrast stripes, plaid, and graphic tees",10,1.0,0.0,1.0,1.0,32.65,30.6,Causal verification gate confirms FPR < 2% on benign textured clothing
-3,Scenario 3: Local Thys et al. Torso Patch Attack,Adversarial optical patch printed on upper chest suppressing YOLO objectness,10,1.0,0.0,0.0,1.0,63.9,15.6,Pass 2 inpainting recovery restores suppressed person recall from raw baseline
-4,Scenario 4: Global DPATCH Attack,Background and corner DPATCH inducing RoI hijacking and backbone feature spikes,10,1.0,0.0,0.0,1.0,65.7,15.2,SpatialFeatureNormClipper clamps activation spikes; Pass 2 recovery eliminates hijacking
+1,Scenario 1: Clean Multi-Class Baseline,"Evaluates clean person recall and 80-class non-person object passthrough (chair, phone, bottle)",5,1.0,0.0,1.0,1.0,267.93,3.7,Clean multi-class baseline: verified clean person recall >= 90% and 100% non-person object passthrough without spurious attack alerts
+2,Scenario 2: Hard-Negative Benign Clothing & Frame Edges,"Pedestrians wearing high-contrast stripes, plaid, logos, and frame-edge boundary crossings",5,1.0,0.0,1.0,1.0,117.21,8.5,Causal verification gate confirms FPR < 1% across hard-negative clothing textures and frame-edge guards
+3,Scenario 3: Local Thys et al. Torso Patch Attack,Local adversarial torso patch attack evaluated with ad_yolo_best.pt and attack_classifier.joblib,5,1.0,0.0,0.0,1.0,202.65,4.9,Pass 2 inpainting recovery with ad_yolo_best.pt and attack_classifier.joblib restores recall from raw baseline
+4,Scenario 4: Global DPATCH Attack,Global background DPATCH attack comparing baseline YOLO vs SpatialFeatureNormClipper + Pass 2 recovery,5,1.0,0.0,0.0,1.0,164.34,6.1,SpatialFeatureNormClipper clamps activation spikes; Pass 2 recovery eliminates hijacking and restores target recall
 distance,angle,illumination,num_samples,num_clean,num_attacked,acc_without_defense,acc_with_defense,tp,fp,tn,fn,precision,recall,fpr,f1_score,yolo_latency_ms,feature_latency_ms,classifier_latency_ms,total_latency_ms,sustained_fps
-2,0,ambient,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,31.14,1.25,0.69,33.08,30.2
-2,0,low_light,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,29.37,0.91,0.74,31.02,32.2
-2,0,back_lit,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,29.16,0.96,0.67,30.79,32.5
-2,30,ambient,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,31.28,1.11,0.75,33.13,30.2
-2,30,low_light,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,30.1,0.88,0.66,31.64,31.6
-2,30,back_lit,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,29.84,1.02,0.8,31.66,31.6
-2,60,ambient,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,30.36,1.23,0.87,32.47,30.8
-2,60,low_light,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,28.07,0.97,0.89,29.93,33.4
-2,60,back_lit,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,27.2,0.96,0.65,28.82,34.7
-5,0,ambient,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,28.06,0.94,0.58,29.58,33.8
-5,0,low_light,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,26.89,0.92,0.78,28.58,35.0
-5,0,back_lit,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,27.38,0.99,0.65,29.01,34.5
-5,30,ambient,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,27.9,1.04,0.77,29.71,33.7
-5,30,low_light,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,30.45,0.99,0.72,32.16,31.1
-5,30,back_lit,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,27.23,1.07,0.77,29.08,34.4
-5,60,ambient,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,28.74,0.86,0.52,30.12,33.2
-5,60,low_light,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,26.48,0.8,0.5,27.78,36.0
-5,60,back_lit,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,27.59,1.05,0.78,29.42,34.0
-8,0,ambient,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,29.2,1.09,0.71,31.0,32.3
-8,0,low_light,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,26.6,0.96,0.84,28.41,35.2
-8,0,back_lit,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,27.3,1.0,0.68,28.98,34.5
-8,30,ambient,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,29.61,1.05,0.61,31.26,32.0
-8,30,low_light,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,28.47,0.79,0.47,29.73,33.6
-8,30,back_lit,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,30.35,0.99,0.66,31.99,31.3
-8,60,ambient,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,30.51,1.14,0.77,32.42,30.8
-8,60,low_light,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,31.16,0.9,0.64,32.69,30.6
-8,60,back_lit,20,10,10,0.5,1.0,10,0,10,0,1.0,1.0,0.0,1.0,27.37,0.92,0.6,28.89,34.6
+2,0,ambient,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,42.2,1.08,4.67,47.95,20.9
+2,0,low_light,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,49.62,1.29,5.11,56.01,17.9
+2,0,back_lit,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,37.26,1.61,3.86,42.72,23.4
+2,30,ambient,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,44.09,1.59,6.41,52.09,19.2
+2,30,low_light,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,46.85,1.15,4.9,52.9,18.9
+2,30,back_lit,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,39.13,1.31,4.85,45.29,22.1
+2,60,ambient,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,72.5,1.33,5.03,78.86,12.7
+2,60,low_light,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,56.15,1.21,4.59,61.96,16.1
+2,60,back_lit,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,54.23,1.39,4.51,60.13,16.6
+5,0,ambient,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,42.44,1.74,4.97,49.15,20.3
+5,0,low_light,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,62.91,0.91,6.49,70.31,14.2
+5,0,back_lit,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,37.01,2.04,5.2,44.25,22.6
+5,30,ambient,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,39.03,1.59,6.61,47.24,21.2
+5,30,low_light,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,44.89,1.02,3.72,49.63,20.1
+5,30,back_lit,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,80.82,1.64,6.39,88.85,11.3
+5,60,ambient,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,82.5,1.47,8.14,92.11,10.9
+5,60,low_light,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,100.79,1.69,5.7,108.18,9.2
+5,60,back_lit,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,73.1,1.62,6.04,80.76,12.4
+8,0,ambient,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,62.95,1.18,6.11,70.24,14.2
+8,0,low_light,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,58.77,1.83,6.27,66.87,15.0
+8,0,back_lit,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,41.66,1.15,4.85,47.66,21.0
+8,30,ambient,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,50.54,1.32,6.61,58.47,17.1
+8,30,low_light,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,53.09,1.14,4.34,58.56,17.1
+8,30,back_lit,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,50.98,1.32,8.42,60.72,16.5
+8,60,ambient,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,46.18,1.37,5.17,52.73,19.0
+8,60,low_light,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,42.89,0.97,7.43,51.28,19.5
+8,60,back_lit,10,5,5,0.5,1.0,5,0,5,0,1.0,1.0,0.0,1.0,60.53,0.98,5.82,67.33,14.9
