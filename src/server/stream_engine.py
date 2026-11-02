@@ -263,6 +263,7 @@ class StreamEngine:
                 prob = float(prediction.attack_probability)
                 top_features = dict(prediction.top_contributing_features)
                 # Enforce temporal persistence: K=4 out of N=5 consecutive frames on interior persons
+                was_confirmed_alert = bool(track.confirmed_attack_alert)
                 confirmed_alert = track.record_attack_prediction(
                     is_threat,
                     is_near_edge=is_near_edge,
@@ -311,7 +312,7 @@ class StreamEngine:
             )
 
             # Only log alerts to SQLite and publish to Redis when confirmed_attack_alert == True
-            if confirmed_alert:
+            if confirmed_alert and not was_confirmed_alert:
                 self.total_attacks_flagged += 1
 
                 # Generate base64 thumbnail crop

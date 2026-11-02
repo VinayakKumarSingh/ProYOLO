@@ -537,7 +537,23 @@ class AttackClassifier:
         )
         case_c = bool(p_attack >= 0.82 and clean_clothing_threshold_exceeded)
 
+        # Case D covers optical patches that suppress the detector but are not
+        # localized by the spatial clipper. Require both a confident model
+        # prediction and a strong temporal suppression signature so ordinary
+        # patterned clothing does not become an alert.
+        conf_drop_value = float(conf_drop if conf_drop is not None else sanitized_vec[1])
+        flicker_value = float(sanitized_vec[7])
+        case_d = bool(
+            p_attack >= self.threshold
+            and (conf_drop_value >= 0.25 or flicker_value >= 0.15)
+        )
+
         local_torso_gate = bool(has_valid_torso_patch and (case_a or case_b or case_c))
+        temporal_suppression_gate = bool(
+            resolved_person_bbox is not None
+            and not has_valid_torso_patch
+            and case_d
+        )
 
         # Rule 4: Disable global background DPATCH alerts on live streams unless
         # max_grid_norm_ratio > 5.0 inside the central 85% of the frame
@@ -556,7 +572,7 @@ class AttackClassifier:
             and resolved_delta_p_obj > 0.35
         )
 
-        causal_gate_passed = bool(local_torso_gate or global_dpatch_gate)
+        causal_gate_passed = bool(local_torso_gate or temporal_suppression_gate or global_dpatch_gate)
         is_attack = causal_gate_passed
 
         case_triggered: Optional[str] = None
@@ -569,6 +585,8 @@ class AttackClassifier:
                 case_triggered = "Case C (High-Confidence Zero-Shot Anomaly)"
         elif global_dpatch_gate:
             case_triggered = "Global DPATCH Gate"
+        elif temporal_suppression_gate:
+            case_triggered = "Case D (Temporal Suppression)"
 
         return AttackPrediction(
             is_attack=is_attack,

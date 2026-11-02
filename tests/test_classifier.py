@@ -355,6 +355,24 @@ class TestAttackClassifierAccuracyAndAlerts:
         assert pred_case_b.causal_verification_passed is True
         assert pred_case_b.patch_conf == 0.75
 
+    def test_interior_person_temporal_suppression_without_patch_roi(self, classifier):
+        """A missed patch ROI must not hide a strong suppression attack signal."""
+        interior_person_bbox = [180.0, 120.0, 360.0, 480.0]
+        attack_vec = np.array(
+            [0.52, 0.38, 0.20, 0.30, 0.25, 0.70, 0.45, 0.22,
+             0.60, 0.65, 0.60, 0.55, 0.55, 1.8, 1.4],
+            dtype=np.float32,
+        )
+
+        prediction = classifier.predict(
+            attack_vec,
+            person_bbox=interior_person_bbox,
+        )
+
+        assert prediction.is_attack is True
+        assert prediction.causal_verification_passed is True
+        assert prediction.case_triggered == "Case D (Temporal Suppression)"
+
     def test_non_person_object_never_flagged(self, classifier):
         """Verifies that non-person objects (class_name != 'person') are NEVER flagged as attack."""
         person_bbox = [100.0, 100.0, 260.0, 480.0]
