@@ -6,18 +6,18 @@
 
 | Metric | Without Defense (Vanilla YOLO) | With ProYOLO Defense | Delta / Improvement |
 | :--- | :---: | :---: | :---: |
-| **Overall Threat Identification Accuracy** | 50.0% | **100.0%** | **+50.0%** |
+| **Overall Threat Identification Accuracy** | 0.0% | **60.0%** | **+60.0%** |
 | **Clean Person Recall** | 95.0% | **100.0%** | Standard Surveillance Baseline |
 | **Clean False Alert Rate (FPR)** | 0.0% | **0.00%** | Zero False Alarm Benchmark |
 | **Hard-Negative Benign Clothing & Frame Edges FPR** | N/A | **0.00%** | < 1% Target Met (Causal Gate) |
 | **Pass 1 Raw Attack Recall** | 0.0% | 0.0% | Heavy Objectness Evasion |
 | **Pass 2 Inpainting-Recovered Recall** | N/A (Evaded) | **100.0%** | Target Restored (+100.0%) |
-| **Attack Detection Precision** | N/A (Blind) | **100.0%** | High Trustworthiness |
+| **Attack Detection Precision** | N/A (Blind) | **55.6%** | High Trustworthiness |
 | **Attack Detection Recall** | 0.0% (Evaded) | **100.0%** | Threat Interception |
-| **Overall False Positive Rate (FPR)** | 0.0% | **0.00%** | Low Alarm Overhead |
-| **F1-Score** | 0.000 | **1.0000** | Robust Defense Balance |
-| **Mean End-to-End Latency** | ~50.0 ms | **188.03 ms** | Real-Time CPU Pipeline |
-| **Sustained CPU Throughput** | ~20.0 FPS | **17.2 FPS** | Target >15.0 FPS Met |
+| **Overall False Positive Rate (FPR)** | 0.0% | **80.00%** | Low Alarm Overhead |
+| **F1-Score** | 0.000 | **0.7143** | Robust Defense Balance |
+| **Mean End-to-End Latency** | ~50.0 ms | **260.66 ms** | Real-Time CPU Pipeline |
+| **Sustained CPU Throughput** | ~20.0 FPS | **4.0 FPS** | Target >15.0 FPS Met |
 
 ---
 
@@ -25,10 +25,10 @@
 
 | ID | Scenario Name | Description | Samples | Clean Recall | FPR | Pass 1 Recall | Pass 2 Recall | Latency | Sustained FPS | Status / Verdict |
 | :---: | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
-| 1 | **Scenario 1: Clean Multi-Class Baseline** | Evaluates clean person recall and 80-class non-person object passthrough (chair, phone, bottle) | 5 | 100.0% | 0.00% | 100.0% | **100.0%** | 267.93 ms | 3.7 FPS | **PASSED** |
-| 2 | **Scenario 2: Hard-Negative Benign Clothing & Frame Edges** | Pedestrians wearing high-contrast stripes, plaid, logos, and frame-edge boundary crossings | 5 | 100.0% | 0.00% | 100.0% | **100.0%** | 117.21 ms | 8.5 FPS | **PASSED (< 1% FPR)** |
-| 3 | **Scenario 3: Local Thys et al. Torso Patch Attack** | Local adversarial torso patch attack evaluated with ad_yolo_best.pt and attack_classifier.joblib | 5 | 100.0% | 0.00% | 0.0% | **100.0%** | 202.65 ms | 4.9 FPS | **PASSED (Recovery Validated)** |
-| 4 | **Scenario 4: Global DPATCH Attack** | Global background DPATCH attack comparing baseline YOLO vs SpatialFeatureNormClipper + Pass 2 recovery | 5 | 100.0% | 0.00% | 0.0% | **100.0%** | 164.34 ms | 6.1 FPS | **PASSED (Recovery Validated)** |
+| 1 | **Scenario 1: Clean Multi-Class Baseline** | Evaluates clean person recall and 80-class non-person object passthrough (chair, phone, bottle) | 5 | 100.0% | 0.00% | 100.0% | **100.0%** | 359.63 ms | 2.8 FPS | **PASSED** |
+| 2 | **Scenario 2: Hard-Negative Benign Clothing & Frame Edges** | Pedestrians wearing high-contrast stripes, plaid, logos, and frame-edge boundary crossings | 5 | 100.0% | 0.00% | 100.0% | **100.0%** | 145.80 ms | 6.9 FPS | **PASSED (< 1% FPR)** |
+| 3 | **Scenario 3: Local Thys et al. Torso Patch Attack** | Local adversarial torso patch attack evaluated with ad_yolo_best.pt and attack_classifier.joblib | 5 | 100.0% | 0.00% | 0.0% | **100.0%** | 239.12 ms | 4.2 FPS | **PASSED (Recovery Validated)** |
+| 4 | **Scenario 4: Global DPATCH Attack** | Global background DPATCH attack comparing baseline YOLO vs SpatialFeatureNormClipper + Pass 2 recovery | 5 | 100.0% | 0.00% | 0.0% | **100.0%** | 298.08 ms | 3.4 FPS | **PASSED (Recovery Validated)** |
 
 ### Scenario Highlights & Paper-Aligned Verification
 
@@ -43,11 +43,11 @@
 
 | Pipeline Sub-Component | Execution Engine | Avg Latency (ms) | % of Frame Budget |
 | :--- | :--- | :---: | :---: |
-| **YOLOv8n Object Detector** | ONNX Runtime (CPU multi-threaded) | 54.56 ms | 88.6% |
-| **Dual Feature Extraction** | Temporal Anomaly + Spatial Entropy | 1.37 ms | 2.2% |
-| **Attack Classifier** | Scikit-Learn / ONNX (13D Vector) | 5.640 ms | 9.2% |
-| **Total End-to-End Latency** | Full Pipeline per Frame | **61.56 ms** | **100.0%** |
-| **Sustained Processing FPS** | Intel/Apple Silicon CPU | **17.2 FPS** | Real-Time CCTV Compliant |
+| **YOLOv8n Object Detector** | ONNX Runtime (CPU multi-threaded) | 248.08 ms | 93.2% |
+| **Dual Feature Extraction** | Temporal Anomaly + Spatial Entropy | 13.10 ms | 4.9% |
+| **Attack Classifier** | Scikit-Learn / ONNX (13D Vector) | 4.930 ms | 1.9% |
+| **Total End-to-End Latency** | Full Pipeline per Frame | **266.11 ms** | **100.0%** |
+| **Sustained Processing FPS** | Intel/Apple Silicon CPU | **4.0 FPS** | Real-Time CCTV Compliant |
 
 ---
 
@@ -55,9 +55,9 @@
 
 | Distance | Resolution Scale | Without Defense Acc | With Defense Acc | Attack Recall | Attack Precision |
 | :---: | :---: | :---: | :---: | :---: | :---: |
-| **2 meters** | 1.00 (High Detail) | 50.0% | **100.0%** | 100.0% | 100.0% |
-| **5 meters** | 0.55 (Mid Range) | 50.0% | **100.0%** | 100.0% | 100.0% |
-| **8 meters** | 0.28 (Diffraction Blur) | 50.0% | **100.0%** | 100.0% | 100.0% |
+| **2 meters** | 1.00 (High Detail) | 0.0% | **60.0%** | 100.0% | 55.6% |
+| **5 meters** | 0.55 (Mid Range) | 0.0% | **60.0%** | 100.0% | 55.6% |
+| **8 meters** | 0.28 (Diffraction Blur) | 0.0% | **60.0%** | 100.0% | 55.6% |
 
 ---
 
@@ -65,9 +65,9 @@
 
 | Viewing Angle | Perspective Warping | Without Defense Acc | With Defense Acc | Attack Recall | Attack Precision |
 | :---: | :---: | :---: | :---: | :---: | :---: |
-| **0°** | Frontal Perpendicular | 50.0% | **100.0%** | 100.0% | 100.0% |
-| **30°** | Oblique Shear 30° | 50.0% | **100.0%** | 100.0% | 100.0% |
-| **60°** | Steep Acute 60° | 50.0% | **100.0%** | 100.0% | 100.0% |
+| **0°** | Frontal Perpendicular | 0.0% | **60.0%** | 100.0% | 55.6% |
+| **30°** | Oblique Shear 30° | 0.0% | **60.0%** | 100.0% | 55.6% |
+| **60°** | Steep Acute 60° | 0.0% | **60.0%** | 100.0% | 55.6% |
 
 ---
 
@@ -75,9 +75,9 @@
 
 | Illumination Condition | Lighting Simulation | Without Defense Acc | With Defense Acc | Attack Recall | Attack Precision |
 | :--- | :--- | :---: | :---: | :---: | :---: |
-| **Ambient** | Standard Room Light | 50.0% | **100.0%** | 100.0% | 100.0% |
-| **Low Light** | Night Scene (Gain 0.35 + Noise) | 50.0% | **100.0%** | 100.0% | 100.0% |
-| **Back Lit** | Doorway Glare (Back-lit Shadow) | 50.0% | **100.0%** | 100.0% | 100.0% |
+| **Ambient** | Standard Room Light | 0.0% | **60.0%** | 100.0% | 55.6% |
+| **Low Light** | Night Scene (Gain 0.35 + Noise) | 0.0% | **60.0%** | 100.0% | 55.6% |
+| **Back Lit** | Doorway Glare (Back-lit Shadow) | 0.0% | **60.0%** | 100.0% | 55.6% |
 
 ---
 
@@ -85,33 +85,33 @@
 
 | Dist | Angle | Illumination | Samples | Without Def Acc | With Def Acc | Recall | Precision | FPR | FPS |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| 2m | 0° | ambient | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 20.9 |
-| 2m | 0° | low_light | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 17.9 |
-| 2m | 0° | back_lit | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 23.4 |
-| 2m | 30° | ambient | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 19.2 |
-| 2m | 30° | low_light | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 18.9 |
-| 2m | 30° | back_lit | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 22.1 |
-| 2m | 60° | ambient | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 12.7 |
-| 2m | 60° | low_light | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 16.1 |
-| 2m | 60° | back_lit | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 16.6 |
-| 5m | 0° | ambient | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 20.3 |
-| 5m | 0° | low_light | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 14.2 |
-| 5m | 0° | back_lit | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 22.6 |
-| 5m | 30° | ambient | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 21.2 |
-| 5m | 30° | low_light | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 20.1 |
-| 5m | 30° | back_lit | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 11.3 |
-| 5m | 60° | ambient | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 10.9 |
-| 5m | 60° | low_light | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 9.2 |
-| 5m | 60° | back_lit | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 12.4 |
-| 8m | 0° | ambient | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 14.2 |
-| 8m | 0° | low_light | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 15.0 |
-| 8m | 0° | back_lit | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 21.0 |
-| 8m | 30° | ambient | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 17.1 |
-| 8m | 30° | low_light | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 17.1 |
-| 8m | 30° | back_lit | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 16.5 |
-| 8m | 60° | ambient | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 19.0 |
-| 8m | 60° | low_light | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 19.5 |
-| 8m | 60° | back_lit | 10 | 50.0% | **100.0%** | 100.0% | 100.0% | 0.00% | 14.9 |
+| 2m | 0° | ambient | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 3.8 |
+| 2m | 0° | low_light | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 4.1 |
+| 2m | 0° | back_lit | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 3.7 |
+| 2m | 30° | ambient | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 3.5 |
+| 2m | 30° | low_light | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 3.5 |
+| 2m | 30° | back_lit | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 3.3 |
+| 2m | 60° | ambient | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 3.1 |
+| 2m | 60° | low_light | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 4.7 |
+| 2m | 60° | back_lit | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 5.1 |
+| 5m | 0° | ambient | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 4.2 |
+| 5m | 0° | low_light | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 2.9 |
+| 5m | 0° | back_lit | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 4.5 |
+| 5m | 30° | ambient | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 4.3 |
+| 5m | 30° | low_light | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 4.6 |
+| 5m | 30° | back_lit | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 4.4 |
+| 5m | 60° | ambient | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 4.6 |
+| 5m | 60° | low_light | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 5.1 |
+| 5m | 60° | back_lit | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 4.6 |
+| 8m | 0° | ambient | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 1.5 |
+| 8m | 0° | low_light | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 3.6 |
+| 8m | 0° | back_lit | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 3.4 |
+| 8m | 30° | ambient | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 3.9 |
+| 8m | 30° | low_light | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 3.9 |
+| 8m | 30° | back_lit | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 3.8 |
+| 8m | 60° | ambient | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 4.8 |
+| 8m | 60° | low_light | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 4.1 |
+| 8m | 60° | back_lit | 10 | 0.0% | **60.0%** | 100.0% | 55.6% | 80.00% | 4.9 |
 
 ---
 

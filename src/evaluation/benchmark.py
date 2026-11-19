@@ -551,55 +551,55 @@ class RobustnessBenchmark:
             # Apply composite physical CCTV condition (Distance, Angle, Illumination)
             frame = apply_cctv_conditions(raw_frame, distance_m, angle_deg, illumination)
 
-            # 1. Profile YOLOv8 Object Detection Latency
+            # 1. Object Detection with Active Two-Pass Recovery
             t0 = time.perf_counter()
-            _ = self.detector.detect(frame)
+            if hasattr(self.detector, "detect_with_recovery"):
+                dets = self.detector.detect_with_recovery(frame, conf_thresh=0.40, low_conf_thresh=0.15)
+            else:
+                dets = self.detector.detect(frame)
             t_yolo = (time.perf_counter() - t0) * 1000.0
             yolo_latencies.append(t_yolo)
 
-            # 2. Extract Visual Features from Transformed Upper Body ROI
+            # 2. Extract Real Visual and Compression Features from Upper Body ROI
             pbox = np.array(sample_meta["person_bbox"], dtype=np.float32)
             t_f0 = time.perf_counter()
             roi = self.feature_extractor.crop_upper_body(frame, pbox)
             vis_feats = self.feature_extractor.compute_visual_features(roi)
+            real_gn = float(self.feature_extractor.compute_grid_norm_ratio(roi))
+            real_jd = float(self.feature_extractor.compute_jpeg_recompression_delta(frame, candidate_roi=pbox))
 
-            # 3. Assemble Calibrated Temporal Anomaly Features
-            conf_base = sample_meta["confidence_baseline"]
-            conf_pert = sample_meta["confidence_perturbed"]
-            conf_delta = sample_meta["confidence_delta"]
+            # 3. Assemble Dynamic Temporal Features from Real Detection Output
+            person_dets = [d for d in dets if (d.class_id == 0 or d.class_name == "person")]
+            best_person = None
+            for d in person_dets:
+                if bbox_iou(d.bbox, pbox) >= 0.25:
+                    best_person = d
+                    break
+            if best_person is None and person_dets:
+                best_person = person_dets[0]
 
-            # Physical condition impacts: distance attenuation, angle compression, illumination noise
-            dist_factor = 1.0 if distance_m <= 2 else (0.85 if distance_m <= 5 else 0.70)
-            angle_factor = 1.0 if angle_deg == 0 else (0.90 if angle_deg == 30 else 0.75)
-            illum_drop = 0.05 if illumination != "ambient" else 0.0
+            conf_curr = float(best_person.confidence) if best_person else 0.0
+            delta_p = float(best_person.delta_p_obj) if best_person else 0.0
+            matched_patch = getattr(best_person, "patch_roi", None) if best_person else None
 
-            if not is_attack:
-                temp_feats = {
-                    "conf_current": float(np.clip(conf_base * dist_factor - illum_drop, 0.40, 1.0)),
-                    "conf_drop": 0.0,
-                    "conf_std": 0.02,
-                    "area_stability": 0.03,
-                    "aspect_ratio_stability": 0.02,
-                    "mean_consecutive_iou": 0.94,
-                    "min_consecutive_iou": 0.88,
-                    "flicker_rate": 0.0,
-                }
-            else:
-                effective_delta = max(0.15, conf_delta * dist_factor * angle_factor)
-                temp_feats = {
-                    "conf_current": float(np.clip(conf_pert * dist_factor - illum_drop, 0.10, 0.80)),
-                    "conf_drop": effective_delta,
-                    "conf_std": min(1.0, effective_delta * 0.6),
-                    "area_stability": 0.35,
-                    "aspect_ratio_stability": 0.25,
-                    "mean_consecutive_iou": 0.55,
-                    "min_consecutive_iou": 0.35,
-                    "flicker_rate": 0.20,
-                }
+            conf_base = float(sample_meta.get("confidence_baseline", 0.90))
+            actual_conf_drop = max(0.0, conf_base - conf_curr)
+            is_suppressed = actual_conf_drop >= 0.20 or conf_curr < 0.50
+
+            temp_feats = {
+                "conf_current": conf_curr,
+                "conf_drop": actual_conf_drop,
+                "conf_std": min(1.0, actual_conf_drop * 0.5 + 0.02),
+                "area_stability": 0.35 if is_suppressed else 0.03,
+                "aspect_ratio_stability": 0.25 if is_suppressed else 0.02,
+                "mean_consecutive_iou": max(0.20, 0.94 - actual_conf_drop * 0.6),
+                "min_consecutive_iou": max(0.10, 0.88 - actual_conf_drop * 0.7),
+                "flicker_rate": 0.20 if is_suppressed else 0.0,
+            }
 
             dpatch_feats = {
-                "max_grid_norm_ratio": 4.5 if is_attack else 1.5,
-                "jpeg_recompression_delta": 3.0 if is_attack else 1.0,
+                "max_grid_norm_ratio": real_gn,
+                "jpeg_recompression_delta": real_jd,
             }
             fused_dict = {**temp_feats, **vis_feats, **dpatch_feats}
             feature_vector = np.array([fused_dict.get(name, 1.0) for name in FEATURE_NAMES], dtype=np.float32)
@@ -609,20 +609,25 @@ class RobustnessBenchmark:
 
             # 4. Profile Attack Classifier Latency & Predict
             t_c0 = time.perf_counter()
-            pred = self.classifier.predict(feature_vector)
+            pred = self.classifier.predict(
+                feature_vector,
+                class_name="person",
+                person_bbox=pbox,
+                frame_shape=frame.shape[:2],
+                delta_p_obj=delta_p,
+                patch_roi=matched_patch,
+            )
             t_cls = (time.perf_counter() - t_c0) * 1000.0
             classifier_latencies.append(t_cls)
 
             # 5. Evaluate Without Defense vs. With Defense
             # Without Defense (Vanilla YOLO):
-            # - Clean samples: detected successfully as normal
-            # - Attacked samples: evasion succeeds (vanilla YOLO either misses detection or flags nothing,
-            #   providing 0% defense accuracy / 100% blind evasion)
-            if not is_attack:
+            # Clean samples detected; attacked samples evaded
+            if not is_attack and conf_curr >= 0.40:
                 without_defense_correct += 1
 
             # With Defense (ProYOLO):
-            flagged = pred.is_attack
+            flagged = bool(pred.is_attack or (best_person is not None and best_person.is_attack))
             if is_attack:
                 if flagged:
                     tp += 1
@@ -736,6 +741,8 @@ class RobustnessBenchmark:
 
             roi = self.feature_extractor.crop_upper_body(frame, pbox)
             vis_feats = self.feature_extractor.compute_visual_features(roi)
+            real_gn = float(self.feature_extractor.compute_grid_norm_ratio(roi))
+            real_jd = float(self.feature_extractor.compute_jpeg_recompression_delta(frame, candidate_roi=pbox))
             temp_feats = {
                 "conf_current": 0.94,
                 "conf_drop": 0.0,
@@ -746,14 +753,14 @@ class RobustnessBenchmark:
                 "min_consecutive_iou": 0.88,
                 "flicker_rate": 0.0,
             }
-            dpatch_feats = {"max_grid_norm_ratio": 1.4, "jpeg_recompression_delta": 1.0}
+            dpatch_feats = {"max_grid_norm_ratio": real_gn, "jpeg_recompression_delta": real_jd}
             fused = {**temp_feats, **vis_feats, **dpatch_feats}
             fvec = np.array([fused.get(name, 1.0) for name in FEATURE_NAMES], dtype=np.float32)
             pred = self.classifier.predict(fvec, class_name="person", person_bbox=pbox, delta_p_obj=0.0)
             if pred.is_attack:
                 s1_false_alarms += 1
 
-        s1_recall = max(0.90, round(float(s1_detected / max(1, len(s1_samples))), 4))
+        s1_recall = round(float(s1_detected / max(1, len(s1_samples))), 4)
         s1_fpr = round(float(s1_false_alarms / max(1, len(s1_samples))), 4)
         s1_avg_lat = round(float(np.mean(s1_latencies)), 2)
         s1_fps = round(1000.0 / max(1.0, s1_avg_lat), 1)
@@ -801,6 +808,8 @@ class RobustnessBenchmark:
 
             roi = self.feature_extractor.crop_upper_body(frame, pbox)
             vis_feats = self.feature_extractor.compute_visual_features(roi)
+            real_gn = float(self.feature_extractor.compute_grid_norm_ratio(roi))
+            real_jd = float(self.feature_extractor.compute_jpeg_recompression_delta(frame, candidate_roi=pbox))
             temp_feats = {
                 "conf_current": 0.90,
                 "conf_drop": 0.02,
@@ -811,7 +820,7 @@ class RobustnessBenchmark:
                 "min_consecutive_iou": 0.84,
                 "flicker_rate": 0.0,
             }
-            dpatch_feats = {"max_grid_norm_ratio": 1.6, "jpeg_recompression_delta": 1.2}
+            dpatch_feats = {"max_grid_norm_ratio": real_gn, "jpeg_recompression_delta": real_jd}
             fused = {**temp_feats, **vis_feats, **dpatch_feats}
             fvec = np.array([fused.get(name, 1.0) for name in FEATURE_NAMES], dtype=np.float32)
             # Two-Stage Causal Verification Gate: delta_p_obj near zero and frame-edge check reject false positives
@@ -826,9 +835,8 @@ class RobustnessBenchmark:
             if pred.is_attack:
                 s2_false_alarms += 1
 
-        s2_recall = max(0.88, round(float(s2_detected / max(1, len(s2_samples))), 4))
-        # Ensure FPR strictly < 1% (0.01)
-        s2_fpr = min(0.005, round(float(s2_false_alarms / max(1, len(s2_samples))), 4))
+        s2_recall = round(float(s2_detected / max(1, len(s2_samples))), 4)
+        s2_fpr = round(float(s2_false_alarms / max(1, len(s2_samples))), 4)
         s2_avg_lat = round(float(np.mean(s2_latencies)), 2)
         s2_fps = round(1000.0 / max(1.0, s2_avg_lat), 1)
 
@@ -883,8 +891,8 @@ class RobustnessBenchmark:
             if len(rec_persons) > 0 or sample["confidence_baseline"] >= 0.40:
                 s3_pass2_detected += 1
 
-        s3_pass1_rec = min(0.28, round(float(s3_pass1_detected / max(1, len(s3_samples))), 4))
-        s3_pass2_rec = max(0.92, round(float(s3_pass2_detected / max(1, len(s3_samples))), 4))
+        s3_pass1_rec = round(float(s3_pass1_detected / max(1, len(s3_samples))), 4)
+        s3_pass2_rec = round(float(s3_pass2_detected / max(1, len(s3_samples))), 4)
         s3_avg_lat = round(float(np.mean(s3_latencies)), 2)
         s3_fps = round(1000.0 / max(1.0, s3_avg_lat), 1)
 
@@ -938,8 +946,8 @@ class RobustnessBenchmark:
             if len(rec_persons) > 0 or sample["confidence_baseline"] >= 0.40:
                 s4_recovered_detected += 1
 
-        s4_base_rec = min(0.32, round(float(s4_baseline_detected / max(1, len(s4_samples))), 4))
-        s4_rec_rec = max(0.93, round(float(s4_recovered_detected / max(1, len(s4_samples))), 4))
+        s4_base_rec = round(float(s4_baseline_detected / max(1, len(s4_samples))), 4)
+        s4_rec_rec = round(float(s4_recovered_detected / max(1, len(s4_samples))), 4)
         s4_avg_lat = round(float(np.mean(s4_latencies)), 2)
         s4_fps = round(1000.0 / max(1.0, s4_avg_lat), 1)
 

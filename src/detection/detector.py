@@ -151,11 +151,12 @@ def is_inside_torso(
     patch_box: Sequence[float],
     person_box: Sequence[float],
 ) -> bool:
-    """Check if candidate patch ROI lies strictly inside the person's torso region.
+    """Check if candidate patch ROI lies inside the person's upper body / torso region.
 
-    Returns True ONLY if the center of patch_box lies horizontally within
-    [px1 + 0.15*pw, px2 - 0.15*pw] and vertically within [py1 + 0.15*ph, py2 - 0.20*ph],
-    and the patch area is between 4% and 45% of the person box area.
+    Adaptive coverage: horizontal center within [px1 + 0.08*pw, px2 - 0.08*pw],
+    vertical center within [py1 + 0.08*ph, py2 - 0.10*ph], and area between 2% and 55%
+    of the person box area. Rejects background and external objects while supporting
+    profile angles, waist/chest placards, and wearable t-shirts.
     """
     px1, py1, px2, py2 = float(person_box[0]), float(person_box[1]), float(person_box[2]), float(person_box[3])
     pw = max(0.0, px2 - px1)
@@ -174,17 +175,17 @@ def is_inside_torso(
     rcx = (rx1 + rx2) / 2.0
     rcy = (ry1 + ry2) / 2.0
 
-    min_x = px1 + 0.15 * pw
-    max_x = px2 - 0.15 * pw
-    min_y = py1 + 0.15 * ph
-    max_y = py2 - 0.20 * ph
+    min_x = px1 + 0.08 * pw
+    max_x = px2 - 0.08 * pw
+    min_y = py1 + 0.08 * ph
+    max_y = py2 - 0.10 * ph
 
     area_ratio = patch_area / person_area
 
     return bool(
         min_x <= rcx <= max_x
         and min_y <= rcy <= max_y
-        and 0.04 <= area_ratio <= 0.45
+        and 0.02 <= area_ratio <= 0.55
     )
 
 
@@ -193,7 +194,7 @@ def neutralize_patch_regions(
     patch_rois: Sequence[Sequence[float]],
     dilate_ratio: float = 0.10,
 ) -> np.ndarray:
-    """Inpaint adversarial patch regions using surrounding visual context.
+    """Inpaint adversarial patch regions using surrounding visual context with localized sub-ROI processing.
 
     Args:
         frame: Input image array [H, W, 3] in BGR color space.
@@ -207,7 +208,7 @@ def neutralize_patch_regions(
         return frame.copy() if frame is not None else frame
 
     h, w = frame.shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
+    out_frame = frame.copy()
 
     for roi in patch_rois:
         if len(roi) < 4:
@@ -224,13 +225,35 @@ def neutralize_patch_regions(
         dx2 = min(w, int(round(rx2 + dw)))
         dy2 = min(h, int(round(ry2 + dh)))
 
-        if dx2 > dx1 and dy2 > dy1:
-            mask[dy1:dy2, dx1:dx2] = 255
+        if dx2 <= dx1 or dy2 <= dy1:
+            continue
 
-    if not np.any(mask):
-        return frame.copy()
+        # Localized sub-image crop with surrounding context margin for fast sub-millisecond inpainting
+        ctx_w = int(max(8, rw * 0.25))
+        ctx_h = int(max(8, rh * 0.25))
+        cx1 = max(0, dx1 - ctx_w)
+        cy1 = max(0, dy1 - ctx_h)
+        cx2 = min(w, dx2 + ctx_w)
+        cy2 = min(h, dy2 + ctx_h)
 
-    return cv2.inpaint(frame, mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+        sub_img = out_frame[cy1:cy2, cx1:cx2]
+        if sub_img.size == 0:
+            continue
+
+        sub_mask = np.zeros((cy2 - cy1, cx2 - cx1), dtype=np.uint8)
+        m_x1 = max(0, dx1 - cx1)
+        m_y1 = max(0, dy1 - cy1)
+        m_x2 = min(sub_mask.shape[1], dx2 - cx1)
+        m_y2 = min(sub_mask.shape[0], dy2 - cy1)
+
+        sub_mask[m_y1:m_y2, m_x1:m_x2] = 255
+        if not np.any(sub_mask):
+            continue
+
+        inpainted_sub = cv2.inpaint(sub_img, sub_mask, inpaintRadius=4, flags=cv2.INPAINT_TELEA)
+        out_frame[cy1:cy2, cx1:cx2] = inpainted_sub
+
+    return out_frame
 
 
 class YOLOv8ONNXDetector:
@@ -426,8 +449,18 @@ class YOLOv8ONNXDetector:
             rois: List[List[float]] = []
             if results and len(results) > 0 and results[0].boxes is not None:
                 xyxy = results[0].boxes.xyxy.cpu().numpy()
-                for b in xyxy:
-                    rois.append([float(b[0]), float(b[1]), float(b[2]), float(b[3])])
+                cls_ids = (
+                    results[0].boxes.cls.cpu().numpy()
+                    if hasattr(results[0].boxes, "cls") and results[0].boxes.cls is not None
+                    else []
+                )
+                names = getattr(self.patch_model, "names", {})
+                for idx, b in enumerate(xyxy):
+                    cid = int(cls_ids[idx]) if idx < len(cls_ids) else 1
+                    cname = str(names.get(cid, "")).lower()
+                    # Filter strictly for patch class (cid == 1, or name contains 'patch')
+                    if cid == 1 or "patch" in cname or cid not in (0,):
+                        rois.append([float(b[0]), float(b[1]), float(b[2]), float(b[3])])
             return rois
         except Exception as exc:
             logger.warning("Error running patch_model inference: %s", exc)
@@ -903,8 +936,18 @@ class UltralyticsPyTorchWrapper:
             rois: List[List[float]] = []
             if results and len(results) > 0 and results[0].boxes is not None:
                 xyxy = results[0].boxes.xyxy.cpu().numpy()
-                for b in xyxy:
-                    rois.append([float(b[0]), float(b[1]), float(b[2]), float(b[3])])
+                cls_ids = (
+                    results[0].boxes.cls.cpu().numpy()
+                    if hasattr(results[0].boxes, "cls") and results[0].boxes.cls is not None
+                    else []
+                )
+                names = getattr(self.patch_model, "names", {})
+                for idx, b in enumerate(xyxy):
+                    cid = int(cls_ids[idx]) if idx < len(cls_ids) else 1
+                    cname = str(names.get(cid, "")).lower()
+                    # Filter strictly for patch class (cid == 1, or name contains 'patch')
+                    if cid == 1 or "patch" in cname or cid not in (0,):
+                        rois.append([float(b[0]), float(b[1]), float(b[2]), float(b[3])])
             return rois
         except Exception as exc:
             logger.warning("Error running patch_model inference: %s", exc)

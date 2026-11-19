@@ -448,16 +448,30 @@ def generate_realistic_dataset(
         gn = extractor.compute_grid_norm_ratio(roi)
         jd = extractor.compute_jpeg_recompression_delta(img, candidate_roi=patch_roi)
 
-        temp_feats = {
-            "conf_current": float(rng.uniform(0.16, 0.48)),  # severely suppressed
-            "conf_drop": float(rng.uniform(0.35, 0.85)),     # large confidence drop
-            "conf_std": float(rng.uniform(0.16, 0.48)),
-            "area_stability": float(rng.uniform(0.22, 0.65)),
-            "aspect_ratio_stability": float(rng.uniform(0.18, 0.50)),
-            "mean_consecutive_iou": float(rng.uniform(0.30, 0.65)),
-            "min_consecutive_iou": float(rng.uniform(0.10, 0.45)),
-            "flicker_rate": float(rng.uniform(0.12, 0.55)),
-        }
+        # Simulate temporal features: 60% active drop, 40% entering directly with patch (conf_drop ~ 0.0)
+        entering_with_patch = (i % 5 < 2)
+        if entering_with_patch:
+            temp_feats = {
+                "conf_current": float(rng.uniform(0.18, 0.45)),  # suppressed from start
+                "conf_drop": float(rng.uniform(0.00, 0.05)),     # no prior baseline to drop from
+                "conf_std": float(rng.uniform(0.02, 0.08)),
+                "area_stability": float(rng.uniform(0.02, 0.10)),
+                "aspect_ratio_stability": float(rng.uniform(0.02, 0.08)),
+                "mean_consecutive_iou": float(rng.uniform(0.80, 0.94)),
+                "min_consecutive_iou": float(rng.uniform(0.70, 0.90)),
+                "flicker_rate": float(rng.uniform(0.00, 0.10)),
+            }
+        else:
+            temp_feats = {
+                "conf_current": float(rng.uniform(0.16, 0.48)),  # severely suppressed
+                "conf_drop": float(rng.uniform(0.35, 0.85)),     # large confidence drop
+                "conf_std": float(rng.uniform(0.16, 0.48)),
+                "area_stability": float(rng.uniform(0.22, 0.65)),
+                "aspect_ratio_stability": float(rng.uniform(0.18, 0.50)),
+                "mean_consecutive_iou": float(rng.uniform(0.30, 0.65)),
+                "min_consecutive_iou": float(rng.uniform(0.10, 0.45)),
+                "flicker_rate": float(rng.uniform(0.12, 0.55)),
+            }
         dpatch_feats = {
             "max_grid_norm_ratio": float(gn),
             "jpeg_recompression_delta": float(jd),
@@ -496,10 +510,15 @@ def generate_synthetic_features(
     n_hard_neg = int(n_neg * hard_negative_ratio)
     n_clean = n_neg - n_hard_neg
 
-    # Type 1: Clean images (label: 0)
+    # Type 1: Clean images (label: 0) - including 15% benign occlusions (conf drop with clean texture)
     clean_X = np.zeros((n_clean, num_features), dtype=np.float32)
     clean_X[:, 0] = rng.uniform(0.82, 0.98, n_clean)  # conf_current
     clean_X[:, 1] = rng.uniform(0.00, 0.06, n_clean)  # conf_drop (near zero)
+    n_occ = int(0.15 * n_clean)
+    if n_occ > 0:
+        clean_X[:n_occ, 0] = rng.uniform(0.35, 0.65, n_occ)
+        clean_X[:n_occ, 1] = rng.uniform(0.30, 0.60, n_occ)  # benign occlusion drop
+        clean_X[:n_occ, 7] = rng.uniform(0.05, 0.20, n_occ)  # slight flicker
     clean_X[:, 2] = rng.uniform(0.01, 0.05, n_clean)  # conf_std
     clean_X[:, 3] = rng.uniform(0.01, 0.06, n_clean)  # area_stability
     clean_X[:, 4] = rng.uniform(0.01, 0.05, n_clean)  # aspect_ratio_stability
@@ -540,6 +559,7 @@ def generate_synthetic_features(
 
     # Type 3: Adversarial Patch images (label: 1)
     # 50% Thys et al. patches (smooth L_tv + L_obj) and 50% DPATCH (high-frequency grid hijack)
+    # Includes 35% FOV entry attacks where conf_drop ~ 0.0
     n_pos = n_samples_per_class
     n_thys = n_pos // 2
     n_dpatch = n_pos - n_thys
@@ -547,6 +567,9 @@ def generate_synthetic_features(
     thys_X = np.zeros((n_thys, num_features), dtype=np.float32)
     thys_X[:, 0] = rng.uniform(0.15, 0.48, n_thys)  # conf_current (severely suppressed)
     thys_X[:, 1] = rng.uniform(0.38, 0.85, n_thys)  # conf_drop (high drop)
+    n_thys_entry = int(0.35 * n_thys)
+    if n_thys_entry > 0:
+        thys_X[:n_thys_entry, 1] = rng.uniform(0.00, 0.05, n_thys_entry)  # entered with patch
     thys_X[:, 2] = rng.uniform(0.16, 0.48, n_thys)  # conf_std
     thys_X[:, 3] = rng.uniform(0.22, 0.65, n_thys)  # area_stability
     thys_X[:, 4] = rng.uniform(0.18, 0.50, n_thys)  # aspect_ratio_stability
@@ -565,6 +588,9 @@ def generate_synthetic_features(
     dpatch_X = np.zeros((n_dpatch, num_features), dtype=np.float32)
     dpatch_X[:, 0] = rng.uniform(0.18, 0.52, n_dpatch)  # conf_current
     dpatch_X[:, 1] = rng.uniform(0.35, 0.80, n_dpatch)  # conf_drop
+    n_dpatch_entry = int(0.35 * n_dpatch)
+    if n_dpatch_entry > 0:
+        dpatch_X[:n_dpatch_entry, 1] = rng.uniform(0.00, 0.05, n_dpatch_entry)  # entered with patch
     dpatch_X[:, 2] = rng.uniform(0.15, 0.45, n_dpatch)  # conf_std
     dpatch_X[:, 3] = rng.uniform(0.25, 0.70, n_dpatch)  # area_stability
     dpatch_X[:, 4] = rng.uniform(0.20, 0.55, n_dpatch)  # aspect_ratio_stability

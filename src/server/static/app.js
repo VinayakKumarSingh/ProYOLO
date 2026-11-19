@@ -126,32 +126,25 @@ function addAlertToFeed(alert) {
 
   card.innerHTML = `
     <div class="alert-top">
-      <span class="alert-cam-id">${alert.camera_id || 'CAM-01'} • Track #${alert.track_id} (${alert.class_name || 'person'})</span>
-      <div class="alert-prob-pill">
-        <span>⚠</span> ${probPercent}% Attack Risk
+      <span class="alert-target-label">
+        <span>⚠</span> Track #${alert.track_id} (${alert.class_name || 'person'})
+      </span>
+      <span class="alert-time">${timeStr}</span>
+    </div>
+    <div class="alert-body">
+      <img class="alert-thumb" src="${thumbSrc}" alt="Target Snapshot" title="Click to inspect snapshot">
+      <div class="alert-meta">
+        <div><strong>Risk:</strong> ${probPercent}% • <strong>Conf:</strong> ${confPercent}%</div>
+        <div style="font-size: 0.65rem; color: #64748b;">${bboxStr}</div>
+        <div style="margin-top: 2px;">${featureTagsHtml}</div>
       </div>
     </div>
-    <div class="alert-content-row">
-      <div class="alert-thumbnail-box" title="Click to inspect snapshot">
-        <img src="${thumbSrc}" alt="Target Snapshot">
-        <div class="alert-thumbnail-overlay"></div>
-      </div>
-      <div class="alert-details">
-        <div class="alert-track-info" style="color: #ff6b8b; font-weight: 700;">PERSON (UNDER ATTACK)</div>
-        <div class="alert-coords">Confidence: ${confPercent}% • BBox: ${bboxStr}</div>
-        <div class="alert-features">${featureTagsHtml}</div>
-      </div>
-    </div>
-    <div class="alert-time">Timestamp: ${timeStr}</div>
   `;
 
   // Click to open snapshot modal
-  const thumbBox = card.querySelector('.alert-thumbnail-box');
-  if (thumbBox) {
-    thumbBox.addEventListener('click', () => {
-      openModal(alert, thumbSrc);
-    });
-  }
+  card.addEventListener('click', () => {
+    openModal(alert, thumbSrc);
+  });
 
   if (elements.alertsContainer) {
     elements.alertsContainer.insertBefore(card, elements.alertsContainer.firstChild);

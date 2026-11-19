@@ -83,11 +83,12 @@ def check_is_inside_torso(
     patch_box: Sequence[float],
     person_box: Sequence[float],
 ) -> bool:
-    """Check if candidate patch ROI lies strictly inside the person's torso region.
+    """Check if candidate patch ROI lies inside the person's upper body / torso region.
 
-    Returns True ONLY if the center of patch_box lies horizontally within
-    [px1 + 0.15*pw, px2 - 0.15*pw] and vertically within [py1 + 0.15*ph, py2 - 0.20*ph],
-    and the patch area is between 4% and 45% of the person box area.
+    Adaptive coverage: horizontal center within [px1 + 0.08*pw, px2 - 0.08*pw],
+    vertical center within [py1 + 0.08*ph, py2 - 0.10*ph], and area between 2% and 55%
+    of the person box area. Rejects background and external objects while supporting
+    profile angles, waist/chest placards, and wearable t-shirts.
     """
     if len(patch_box) < 4 or len(person_box) < 4:
         return False
@@ -108,17 +109,17 @@ def check_is_inside_torso(
     rcx = (rx1 + rx2) / 2.0
     rcy = (ry1 + ry2) / 2.0
 
-    min_x = px1 + 0.15 * pw
-    max_x = px2 - 0.15 * pw
-    min_y = py1 + 0.15 * ph
-    max_y = py2 - 0.20 * ph
+    min_x = px1 + 0.08 * pw
+    max_x = px2 - 0.08 * pw
+    min_y = py1 + 0.08 * ph
+    max_y = py2 - 0.10 * ph
 
     area_ratio = patch_area / person_area
 
     return bool(
         min_x <= rcx <= max_x
         and min_y <= rcy <= max_y
-        and 0.04 <= area_ratio <= 0.45
+        and 0.02 <= area_ratio <= 0.55
     )
 
 
@@ -548,11 +549,21 @@ class AttackClassifier:
             and (conf_drop_value >= 0.25 or flicker_value >= 0.15)
         )
 
+        # Case E covers optical patches where the adversary enters the scene already wearing the patch
+        # (conf_drop ~ 0.0, but person confidence is suppressed <= 0.55 and spatial/compression
+        # anomaly thresholds exceed clean clothing baselines).
+        conf_current_val = float(sanitized_vec[0])
+        case_e = bool(
+            p_attack >= self.threshold
+            and conf_current_val <= 0.55
+            and clean_clothing_threshold_exceeded
+        )
+
         local_torso_gate = bool(has_valid_torso_patch and (case_a or case_b or case_c))
         temporal_suppression_gate = bool(
             resolved_person_bbox is not None
             and not has_valid_torso_patch
-            and case_d
+            and (case_d or case_e)
         )
 
         # Rule 4: Disable global background DPATCH alerts on live streams unless
@@ -586,7 +597,10 @@ class AttackClassifier:
         elif global_dpatch_gate:
             case_triggered = "Global DPATCH Gate"
         elif temporal_suppression_gate:
-            case_triggered = "Case D (Temporal Suppression)"
+            if case_d:
+                case_triggered = "Case D (Temporal Suppression)"
+            else:
+                case_triggered = "Case E (Static Suppression & Spatial Anomaly)"
 
         return AttackPrediction(
             is_attack=is_attack,

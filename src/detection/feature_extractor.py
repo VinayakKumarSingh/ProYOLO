@@ -122,6 +122,85 @@ class SpatialFeatureNormClipper:
         else:
             self.current_image = None
 
+        # Automatically localize spatial and compression anomalies in image coordinates (ONNX-compatible)
+        if self.current_image is not None:
+            self.localize_image_anomalies(self.current_image)
+
+    def localize_image_anomalies(self, image: Optional[np.ndarray]) -> List[List[float]]:
+        """Compute spatial gradient & JPEG compression anomaly map directly on image (ONNX-compatible)."""
+        if image is None or image.size == 0:
+            return []
+
+        h, w = image.shape[:2]
+        target_w, target_h = 320, 320
+        scale_x = w / float(target_w)
+        scale_y = h / float(target_h)
+        small_img = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+        gray = cv2.cvtColor(small_img, cv2.COLOR_BGR2GRAY)
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(gx**2 + gy**2)
+
+        m_h = max(1, int(self.border_margin * target_h))
+        m_w = max(1, int(self.border_margin * target_w))
+        interior = grad_mag[m_h:target_h - m_h, m_w:target_w - m_w]
+        if interior.size == 0:
+            return []
+
+        mu = float(np.mean(interior))
+        sigma = float(np.std(interior))
+        tau = mu + self.alpha * sigma
+
+        max_g = float(np.max(interior))
+        self.max_grid_norm_ratio = float(max_g / (mu + 1e-6))
+        self.last_mu_E = mu
+        self.last_sigma_E = sigma
+        self.last_tau = tau
+
+        anomaly = np.clip(grad_mag - tau, 0.0, None)
+        a_max = float(np.max(anomaly))
+        if a_max > 1e-4:
+            s_map = (anomaly / a_max).astype(np.float32)
+        else:
+            s_map = np.zeros_like(anomaly, dtype=np.float32)
+
+        jpeg_diff = self.compute_jpeg_diff_map(small_img, quality=self.quality)
+        self.jpeg_diff_map = jpeg_diff
+        self.spatial_anomaly_heatmap = s_map
+
+        merged = s_map * (0.5 + 0.5 * jpeg_diff)
+        merged[0:m_h, :] = 0.0
+        merged[target_h - m_h:target_h, :] = 0.0
+        merged[:, 0:m_w] = 0.0
+        merged[:, target_w - m_w:target_w] = 0.0
+
+        m_max = float(np.max(merged))
+        if m_max > 1e-4:
+            self.merged_heatmap = (merged / m_max).astype(np.float32)
+            small_rois = self._extract_candidate_rois(self.merged_heatmap)
+            scaled_rois: List[List[float]] = []
+            for r in small_rois:
+                scaled_rois.append([
+                    round(r[0] * scale_x, 1),
+                    round(r[1] * scale_y, 1),
+                    round(r[2] * scale_x, 1),
+                    round(r[3] * scale_y, 1),
+                ])
+            self.patch_rois = scaled_rois
+        else:
+            self.merged_heatmap = np.zeros_like(merged, dtype=np.float32)
+            self.patch_rois = []
+
+        if image is not None and self.patch_rois:
+            self.jpeg_recompression_delta = self.compute_jpeg_recompression_delta(
+                image, candidate_roi=self.patch_rois[0], quality=self.quality
+            )
+        else:
+            self.jpeg_recompression_delta = 1.0
+
+        return self.patch_rois
+
     @staticmethod
     def compute_jpeg_diff_map(image: np.ndarray, quality: int = 75) -> np.ndarray:
         """Compute normalized squared L2 difference map ||X - JPEG(X, quality)||_2^2."""
